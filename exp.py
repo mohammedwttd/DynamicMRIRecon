@@ -4,12 +4,25 @@ import json
 import shlex
 import sys
 
-from sympy.physics.units import acceleration
-
-data_path = '/mnt/walkure_public/users/mohammedw/fastmri_downloads/'
+data_path = '../data'
 
 lr = {
     'Unet': {
+        'rec_lr': 5e-4,
+        'sub_lr': {
+            'cartesian': 0.025,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 10,
+            'radial': 30,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'DynamicUnet': {
         'rec_lr': 5e-4,
         'sub_lr': {
             'cartesian': 0.025,
@@ -85,15 +98,21 @@ vel_weight = 0.001
 batch_size = 1
 n_shots = 16
 
-model = 'vit-l-pretrained-radial'
+model = 'DynamicUnet'  # Can be 'Unet' or 'DynamicUnet'
 init = 'radial'
 noise = ''
 noise_behaviour = ''
 
 num_epochs = 30
 trajectory_learning = 1
-sample_rate = 0.25
+sample_rate = 0.05
 inter_gap_mode = "changing_downwards_15"
+
+# Dynamic U-Net parameters (only used if model='DynamicUnet')
+growth_method = 'sample_select'  # 'sample_select' or 'split'
+n_candidates = 10  # Number of candidates for sample_select
+growth_interval = 1  # Grow every N epochs
+layers_to_grow = ['bottleneck']  # Which layers to grow
 
 clr = lr[model]
 sub_lr = clr['sub_lr'][init]
@@ -200,6 +219,10 @@ command = f'python3 train.py --test-name={test_name} ' \
           f'--noise-type={noise_type} '  \
           f'--noise-p={noise_p} '  \
           f'--acceleration={acceleration} '  \
-          f'--center-fraction={center_fraction}'
+          f'--center-fraction={center_fraction} ' \
+          f'--growth-method={growth_method} ' \
+          f'--n-candidates={n_candidates} ' \
+          f'--growth-interval={growth_interval} ' \
+          f'--layers-to-grow {" ".join(layers_to_grow)}'
 
 os.system(command)

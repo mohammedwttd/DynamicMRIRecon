@@ -5,8 +5,9 @@ import json
 import fastmri.models
 from models.rec_models.unet_model import UnetModel
 from models.rec_models.complex_unet import ComplexUnetModel
+from models.rec_models.dynamic_unet_model import DynamicUnetModel
 import data.transforms as transforms
-from pytorch_nufft.nufft2 import nufft, nufft_adjoint
+from pytorch_nufft.nufft import nufft, nufft_adjoint
 import numpy as np
 from WaveformProjection.run_projection import proj_handler
 import matplotlib.pylab as P
@@ -17,7 +18,6 @@ from  models.VarBlock import VarNet
 from typing import Tuple
 from fastmri.data.subsample import create_mask_for_mask_type
 from fastmri.data.transforms import apply_mask
-from models.rec_models.dcg import Generator, Discriminator
 import random
 import fastmri
 
@@ -395,7 +395,8 @@ class Subsampling_Model(nn.Module):
     def __init__(self, in_chans, out_chans, chans, num_pool_layers, drop_prob, decimation_rate, res,
                  trajectory_learning, initialization, n_shots, interp_gap, SNR=False, type=None,
                  img_size=(320, 320) ,window_size=10, embed_dim=66, num_blocks=1, sample_per_shot=3001,
-                 epsilon = 0, epsilon_step = None, noise_p = 0, std = 0, acceleration=4, center_fraction=0.08, noise ="", epochs = 40):
+                 epsilon = 0, epsilon_step = None, noise_p = 0, std = 0, acceleration=4, center_fraction=0.08, noise ="", epochs = 40,
+                 growth_method='sample_select', n_candidates=10, growth_interval=10, layers_to_grow=None):
         super().__init__()
         self.type = type
         self.noise_model = NoiseScheduler(epsilon,warmup_steps=4, total_steps=epochs, final_noise=0, constant_steps=0, mode = noise)
@@ -435,11 +436,16 @@ class Subsampling_Model(nn.Module):
 
         elif type == 'Unet':
             self.reconstruction_model = UnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob)
+        elif type == 'DynamicUnet':
+            self.reconstruction_model = DynamicUnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                                                          growth_method=growth_method, n_candidates=n_candidates)
+            # Store growth parameters
+            self.growth_interval = growth_interval
+            self.layers_to_grow = layers_to_grow if layers_to_grow else ['bottleneck']
+            self.growth_enabled = True
         elif type == 'humus':
             HUMUSReconstructionNet = HUMUSBlock(img_size=img_size, in_chans =in_chans, out_chans = out_chans, num_blocks = num_blocks, window_size = window_size, embed_dim = embed_dim)
             self.reconstruction_model = HUMUSReconstructionNet
-        elif type == 'DCG':
-            self.reconstruction_model = {"G": Generator().to("cuda"), "D": Discriminator().to("cuda")}
         
 
         self.iter = 0
@@ -449,7 +455,7 @@ class Subsampling_Model(nn.Module):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
-        elif self.type == 'Unet':
+        elif self.type == 'Unet' or self.type == 'DynamicUnet':
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
@@ -471,3 +477,60 @@ class Subsampling_Model(nn.Module):
 
     def increase_noise_linearly(self):
         self.subsampling.increase_noise_linearly()
+    
+    def grow_network_if_needed(self, epoch, batch_data, target_data, criterion):
+        """
+        Grow the Dynamic U-Net if conditions are met.
+        
+        Args:
+            epoch: Current epoch number
+            batch_data: Batch for gradient calculation
+            target_data: Target batch for loss calculation
+            criterion: Loss function
+        
+        Returns:
+            bool: True if growth occurred
+        """
+        if self.type != 'DynamicUnet' or not hasattr(self, 'growth_enabled'):
+            return False
+        
+        if not self.growth_enabled:
+            return False
+        
+        # Check if it's time to grow
+        if (epoch + 1) % self.growth_interval != 0 or epoch == 0:
+            return False
+        
+        print(f"\n{'='*60}")
+        print(f"Growing network at epoch {epoch + 1}")
+        print(f"{'='*60}")
+        
+        # Grow each specified layer
+        for layer_idx in self.layers_to_grow:
+            try:
+                self.reconstruction_model.grow_network(
+                    layer_idx=layer_idx,
+                    conv_idx=1,  # Grow second conv in the block
+                    batch_data=batch_data,
+                    target_data=target_data,
+                    criterion=criterion
+                )
+                print(f"  Grew layer: {layer_idx}")
+            except Exception as e:
+                print(f"  Failed to grow {layer_idx}: {e}")
+        
+        # Print new network size
+        new_size = self.reconstruction_model.get_network_size()
+        print(f"\nNew network size:")
+        for layer_name, sizes in new_size.items():
+            if layer_name in self.layers_to_grow or layer_name == 'bottleneck':
+                print(f"  {layer_name}: {sizes}")
+        print(f"{'='*60}\n")
+        
+        return True
+    
+    def get_network_size(self):
+        """Get current size of the reconstruction network."""
+        if self.type == 'DynamicUnet' and hasattr(self.reconstruction_model, 'get_network_size'):
+            return self.reconstruction_model.get_network_size()
+        return None

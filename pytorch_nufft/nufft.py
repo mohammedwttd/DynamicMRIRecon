@@ -2,7 +2,7 @@ from pytorch_nufft import util
 import pytorch_nufft.interp as interp
 import numpy
 import torch
-from data import transforms2
+from data import transforms
 
 
 def nufft(input, coord, oversamp=1.25, width=4.0, n=128, device='cuda'):

@@ -665,6 +665,11 @@ def build_model(args):
         center_fraction=args.center_fraction,
         noise = args.noise_behaviour,
         epochs = args.num_epochs,
+        # Dynamic U-Net parameters
+        growth_method=args.growth_method if hasattr(args, 'growth_method') else 'sample_select',
+        n_candidates=args.n_candidates if hasattr(args, 'n_candidates') else 10,
+        growth_interval=args.growth_interval if hasattr(args, 'growth_interval') else 10,
+        layers_to_grow=args.layers_to_grow if hasattr(args, 'layers_to_grow') else ['bottleneck'],
     ).to(args.device)
     return model
 
@@ -806,6 +811,31 @@ def train():
         if noise_behaviour == "log":
             model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
         train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask)
+        
+        # Dynamic U-Net growth (if applicable)
+        if args.model == 'DynamicUnet' and epoch >= 0:
+            # Get a sample batch for gradient calculation
+            sample_batch = next(iter(train_loader))
+            input_data, target_data, _, _, _ = sample_batch
+            input_data = input_data.to(args.device)
+            target_data = target_data.to(args.device)
+            
+            # Prepare data for growth (needs to go through subsampling)
+            with torch.no_grad():
+                subsampled_input = model.module.subsampling(input_data) if args.data_parallel else model.subsampling(input_data)
+            
+            # Define a simple criterion for growth
+            criterion = torch.nn.MSELoss()
+            
+            # Attempt growth
+            growth_occurred = model.module.grow_network_if_needed(epoch, subsampled_input, target_data, criterion) if args.data_parallel else model.grow_network_if_needed(epoch, subsampled_input, target_data, criterion)
+            
+            # If growth occurred, reset optimizer to include new parameters
+            if growth_occurred:
+                optimizer, optimizer_sub = build_optim(args, model)
+                scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
+                logging.info(f"Optimizer reset after network growth at epoch {epoch}")
+        
         dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer, adv_mask)
         metrics += (dev_loss, dev_time, psnr_mean, ssim_mean)
         if best_psnr_mean < psnr_mean:
@@ -892,6 +922,17 @@ def create_arg_parser():
                         help='number of interpolated points between 2 parameter points in the trajectory')
     parser.add_argument('--model', type=str, default='Unet',
                         help='the model type and params of the reconstruction net')
+    
+    # Dynamic U-Net parameters
+    parser.add_argument('--growth-method', type=str, default='sample_select', choices=['sample_select', 'split'],
+                        help='Growth method for Dynamic U-Net: sample_select or split')
+    parser.add_argument('--n-candidates', type=int, default=10,
+                        help='Number of candidates to try for sample_select growth method')
+    parser.add_argument('--growth-interval', type=int, default=10,
+                        help='Grow network every N epochs (for DynamicUnet)')
+    parser.add_argument('--layers-to-grow', type=str, nargs='+', default=['bottleneck'],
+                        help='Which layers to grow (e.g., bottleneck down_3 up_0)')
+    
     parser.add_argument('--inter-gap-mode', type=str, default='constant',
                         help='How the interpolated gap will change during the training')
     parser.add_argument('--img-size', type=int, nargs=2, default=[320, 320], help='Image size (height, width)')
