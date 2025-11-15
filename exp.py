@@ -105,13 +105,13 @@ noise_behaviour = ''
 
 num_epochs = 30
 trajectory_learning = 1
-sample_rate = 0.05
+sample_rate = 0.01  # Start with reasonable sample rate
 inter_gap_mode = "changing_downwards_15"
 
 # Dynamic U-Net parameters (only used if model='DynamicUnet')
 growth_method = 'sample_select'  # 'sample_select' or 'split'
 n_candidates = 10  # Number of candidates for sample_select
-growth_interval = 1  # Grow every N epochs
+growth_interval = 1  # Grow every N epochs (10 is reasonable, 1 is too aggressive!)
 layers_to_grow = ['bottleneck']  # Which layers to grow
 
 clr = lr[model]

@@ -106,7 +106,7 @@ def create_datasets(args):
     dev_data = SliceData(
         root=args.data_path / f'multicoil_val',
         transform=DataTransform(args.resolution),
-        sample_rate=1)
+        sample_rate=0.1)
 
     return dev_data, train_data
 
@@ -813,28 +813,47 @@ def train():
         train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask)
         
         # Dynamic U-Net growth (if applicable)
-        if args.model == 'DynamicUnet' and epoch >= 0:
-            # Get a sample batch for gradient calculation
-            sample_batch = next(iter(train_loader))
-            input_data, target_data, _, _, _ = sample_batch
-            input_data = input_data.to(args.device)
-            target_data = target_data.to(args.device)
-            
-            # Prepare data for growth (needs to go through subsampling)
-            with torch.no_grad():
-                subsampled_input = model.module.subsampling(input_data) if args.data_parallel else model.subsampling(input_data)
-            
-            # Define a simple criterion for growth
-            criterion = torch.nn.MSELoss()
-            
-            # Attempt growth
-            growth_occurred = model.module.grow_network_if_needed(epoch, subsampled_input, target_data, criterion) if args.data_parallel else model.grow_network_if_needed(epoch, subsampled_input, target_data, criterion)
-            
-            # If growth occurred, reset optimizer to include new parameters
-            if growth_occurred:
-                optimizer, optimizer_sub = build_optim(args, model)
-                scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
-                logging.info(f"Optimizer reset after network growth at epoch {epoch}")
+        # Safety check: don't grow too frequently (minimum 5 epochs between growths)
+        min_growth_interval = max(args.growth_interval if hasattr(args, 'growth_interval') else 10, 5)
+        if args.model == 'DynamicUnet' and epoch > 0 and (epoch % min_growth_interval == 0):
+            try:
+                # Get a sample batch for gradient calculation
+                sample_iter = iter(train_loader)
+                sample_batch = next(sample_iter)
+                input_data, target_data, _, _, _ = sample_batch
+                input_data = input_data.to(args.device)
+                target_data = target_data.to(args.device)
+                
+                # Prepare data for growth (process through full forward pass to get reconstructed output)
+                with torch.no_grad():
+                    # Get the subsampled and reconstructed data
+                    if args.data_parallel:
+                        subsampled_input = model.module.subsampling(input_data)
+                    else:
+                        subsampled_input = model.subsampling(input_data)
+                
+                # Define a simple criterion for growth
+                criterion = torch.nn.MSELoss()
+                
+                # Attempt growth - use the subsampled input and target
+                if args.data_parallel:
+                    growth_occurred = model.module.grow_network_if_needed(
+                        epoch, subsampled_input, target_data, criterion
+                    )
+                else:
+                    growth_occurred = model.grow_network_if_needed(
+                        epoch, subsampled_input, target_data, criterion
+                    )
+                
+                # If growth occurred, reset optimizer to include new parameters
+                if growth_occurred:
+                    optimizer, optimizer_sub = build_optim(args, model)
+                    scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
+                    logging.info(f"Optimizer reset after network growth at epoch {epoch}")
+            except Exception as e:
+                logging.warning(f"Failed to perform network growth at epoch {epoch}: {e}")
+                import traceback
+                traceback.print_exc()
         
         dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer, adv_mask)
         metrics += (dev_loss, dev_time, psnr_mean, ssim_mean)

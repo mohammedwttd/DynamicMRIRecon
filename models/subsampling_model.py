@@ -347,6 +347,8 @@ class Subsampling_Layer(nn.Module):
 
         x_full = torch.clamp(self.add_normed_noise(self.x.reshape(-1,2)), min=-160, max=160)
 
+        if input.ndim == 4:
+            input = input.unsqueeze(1)
         input = input.permute(0, 1, 4, 2, 3)
         sub_ksp = nufft(input, x_full)
         if self.SNR:
