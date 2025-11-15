@@ -1,0 +1,31 @@
+# Ignore everything by default
+*
+
+# Allow Python files
+!*.py
+
+# Allow Jupyter notebooks
+!*.ipynb
+
+# Allow directories (needed to traverse into subdirectories)
+!*/
+
+# Optional: Allow specific important files
+!.gitignore
+!README.md
+!requirements.txt
+!setup.py
+!LICENSE
+
+# Explicitly ignore Python cache and compiled files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
