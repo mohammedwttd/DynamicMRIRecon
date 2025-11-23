@@ -1,21 +1,22 @@
 """
-Dynamic U-Net with GradMax-inspired growth mechanisms.
+Simplified Dynamic U-Net that swaps channels between layers.
 
-Supports two growth strategies:
-1. Sample-and-Select: Add N candidate filters, pick the one with highest gradient
-2. Gradient-Informed Splitting: Duplicate the filter with largest gradient, add noise
+Every N batches:
+- Removes one channel from a layer with low gradient magnitude
+- Adds one channel to another layer (gradient-informed initialization)
+- Keeps total parameter count constant
 """
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-import copy
-from typing import Tuple, Optional, List
+import random
+from typing import Dict, List, Tuple
 
 
 class DynamicConvBlock(nn.Module):
     """
-    A Convolutional Block that can dynamically grow during training.
+    A Convolutional Block that can dynamically grow/shrink during training.
     """
 
     def __init__(self, in_chans, out_chans, drop_prob):
@@ -31,7 +32,7 @@ class DynamicConvBlock(nn.Module):
         self.out_chans = out_chans
         self.drop_prob = drop_prob
 
-        # Store layers separately for easier manipulation during growth
+        # Store layers separately for easier manipulation
         self.conv1 = nn.Conv2d(in_chans, out_chans, kernel_size=3, padding=1)
         self.norm1 = nn.InstanceNorm2d(out_chans)
         self.relu1 = nn.ReLU()
@@ -62,10 +63,6 @@ class DynamicConvBlock(nn.Module):
         
         return output
 
-    def get_growable_layers(self):
-        """Returns list of conv layers that can be grown."""
-        return [self.conv1, self.conv2]
-
     def __repr__(self):
         return f'DynamicConvBlock(in_chans={self.in_chans}, out_chans={self.out_chans}, ' \
             f'drop_prob={self.drop_prob})'
@@ -73,15 +70,11 @@ class DynamicConvBlock(nn.Module):
 
 class DynamicUnetModel(nn.Module):
     """
-    Dynamic U-Net that can grow during training using GradMax-inspired methods.
-    
-    Growth methods:
-    - 'sample_select': Sample N candidates, select the one with highest gradient
-    - 'split': Duplicate the filter with highest gradient and add noise
+    Simplified Dynamic U-Net that swaps channels between layers every N batches.
     """
 
     def __init__(self, in_chans, out_chans, chans, num_pool_layers, drop_prob, 
-                 growth_method='sample_select', n_candidates=10):
+                 swap_frequency=10):
         """
         Args:
             in_chans (int): Number of channels in the input to the U-Net model.
@@ -89,8 +82,7 @@ class DynamicUnetModel(nn.Module):
             chans (int): Number of output channels of the first convolution layer.
             num_pool_layers (int): Number of down-sampling and up-sampling layers.
             drop_prob (float): Dropout probability.
-            growth_method (str): 'sample_select' or 'split'
-            n_candidates (int): Number of candidate filters to try (for sample_select)
+            swap_frequency (int): Perform channel swap every N batches (default: 10)
         """
         super().__init__()
 
@@ -99,9 +91,12 @@ class DynamicUnetModel(nn.Module):
         self.chans = chans
         self.num_pool_layers = num_pool_layers
         self.drop_prob = drop_prob
-        self.growth_method = growth_method
-        self.n_candidates = n_candidates
-
+        self.swap_frequency = swap_frequency
+        
+        # Track batch counter
+        self.batch_counter = 0
+        
+        # Build U-Net architecture
         self.down_sample_layers = nn.ModuleList([DynamicConvBlock(in_chans, chans, drop_prob)])
         ch = chans
         for i in range(num_pool_layers - 1):
@@ -114,6 +109,7 @@ class DynamicUnetModel(nn.Module):
             self.up_sample_layers += [DynamicConvBlock(ch * 2, ch // 2, drop_prob)]
             ch //= 2
         self.up_sample_layers += [DynamicConvBlock(ch * 2, ch, drop_prob)]
+        
         self.conv2 = nn.Sequential(
             nn.Conv2d(ch, ch // 2, kernel_size=1),
             nn.Conv2d(ch // 2, out_chans, kernel_size=1),
@@ -130,6 +126,7 @@ class DynamicUnetModel(nn.Module):
         """
         stack = []
         output = input
+        
         # Apply down-sampling layers
         for layer in self.down_sample_layers:
             output = layer(output)
@@ -143,207 +140,120 @@ class DynamicUnetModel(nn.Module):
             output = F.interpolate(output, scale_factor=2, mode='bilinear', align_corners=True)
             output = torch.cat([output, stack.pop()], dim=1)
             output = layer(output)
+            
         return self.conv2(output)
 
-    def grow_layer_sample_select(self, layer_idx: str, conv_idx: int, batch_data: torch.Tensor,
-                                   target_data: torch.Tensor, criterion) -> Tuple[torch.Tensor, int]:
+    def get_swappable_layers(self) -> List[Tuple[str, nn.Module, str]]:
         """
-        Grow a layer using Sample-and-Select method.
+        Get list of conv layers that can participate in channel swapping.
+        
+        Skip connections make some layers unsuitable for swapping:
+        - Encoder conv2 outputs feed into decoder via skip connections
+        - Decoder conv1 inputs receive concatenated features
+        
+        Safe to swap:
+        - Encoder conv1 (only affects conv2 in same block)
+        - Bottleneck (both conv1 and conv2)
+        - Decoder conv2 (only affects next decoder block)
+        
+        Returns:
+            List of tuples: (layer_id, block, conv_name)
+        """
+        layers = []
+        
+        # Encoder layers - ONLY conv1 (conv2 feeds skip connections)
+        for i, block in enumerate(self.down_sample_layers):
+            layers.append((f'down_{i}', block, 'conv1'))
+            # Skip conv2 to avoid skip connection issues
+        
+        # Bottleneck - safe to swap both
+        layers.append(('bottleneck', self.conv, 'conv1'))
+        layers.append(('bottleneck', self.conv, 'conv2'))
+        
+        # Decoder layers - ONLY conv2 (conv1 receives concatenated input)
+        for i, block in enumerate(self.up_sample_layers):
+            # Skip conv1 to avoid concatenation issues
+            layers.append((f'up_{i}', block, 'conv2'))
+        
+        return layers
+
+    def find_channel_to_drop(self, layer_id: str, block: nn.Module, conv_name: str) -> int:
+        """
+        Find the channel with lowest gradient magnitude to drop.
         
         Args:
-            layer_idx (str): Layer identifier ('bottleneck', 'down_0', 'up_0', etc.)
-            conv_idx (int): Which conv in the block (0 or 1)
-            batch_data (torch.Tensor): Input batch for gradient calculation
-            target_data (torch.Tensor): Target batch for loss calculation
-            criterion: Loss function
+            layer_id (str): Layer identifier
+            block (nn.Module): The conv block
+            conv_name (str): 'conv1' or 'conv2'
             
         Returns:
-            winner_weights (torch.Tensor): Weights of the winning filter
-            winner_idx (int): Index of the winning candidate
+            int: Index of channel to drop
         """
-        # Get the target layer
-        if layer_idx == 'bottleneck':
-            block = self.conv
-        elif layer_idx.startswith('down_'):
-            idx = int(layer_idx.split('_')[1])
-            block = self.down_sample_layers[idx]
-        elif layer_idx.startswith('up_'):
-            idx = int(layer_idx.split('_')[1])
-            block = self.up_sample_layers[idx]
-        else:
-            raise ValueError(f"Invalid layer_idx: {layer_idx}")
+        conv_layer = getattr(block, conv_name)
+        
+        # Check if gradients exist
+        if conv_layer.weight.grad is None:
+            # Random selection if no gradient
+            return random.randint(0, conv_layer.out_channels - 1)
+        
+        # Calculate gradient magnitude for each output channel (filter)
+        grad_norms = torch.norm(conv_layer.weight.grad.view(conv_layer.out_channels, -1), dim=1)
+        
+        # Return index of channel with minimum gradient
+        return torch.argmin(grad_norms).item()
 
-        # Get the specific conv layer
-        conv_layer = block.conv1 if conv_idx == 0 else block.conv2
+    def find_channel_to_add(self, layer_id: str, block: nn.Module, conv_name: str) -> torch.Tensor:
+        """
+        Create a new channel using gradient-informed initialization.
+        Similar to GradMax: find filter with highest gradient and add noise to it.
         
-        # Store original state
-        original_out_channels = conv_layer.out_channels
-        original_weight = conv_layer.weight.data.clone()
-        original_bias = conv_layer.bias.data.clone() if conv_layer.bias is not None else None
+        Args:
+            layer_id (str): Layer identifier
+            block (nn.Module): The conv block
+            conv_name (str): 'conv1' or 'conv2'
+            
+        Returns:
+            torch.Tensor: New filter weights
+        """
+        conv_layer = getattr(block, conv_name)
         
-        # Create N candidate filters
-        candidates = []
-        for _ in range(self.n_candidates):
-            # Initialize new filter with Kaiming initialization
+        if conv_layer.weight.grad is None:
+            # Random initialization if no gradient
             new_filter = torch.zeros(1, conv_layer.in_channels, 
                                     conv_layer.kernel_size[0], conv_layer.kernel_size[1],
                                     device=conv_layer.weight.device)
             nn.init.kaiming_normal_(new_filter, mode='fan_out', nonlinearity='relu')
-            candidates.append(new_filter)
+            return new_filter
         
-        # Test each candidate
-        gradient_norms = []
-        
-        for candidate in candidates:
-            # Temporarily add the candidate
-            new_weight = torch.cat([original_weight, candidate], dim=0)
-            conv_layer.out_channels = original_out_channels + 1
-            conv_layer.weight = nn.Parameter(new_weight)
-            
-            if original_bias is not None:
-                new_bias_val = torch.zeros(1, device=conv_layer.bias.device)
-                new_bias = torch.cat([original_bias, new_bias_val], dim=0)
-                conv_layer.bias = nn.Parameter(new_bias)
-            
-            # Temporarily update the consuming layer for silent addition
-            consuming_layer_info = self._get_consuming_layer_info(layer_idx, conv_idx)
-            original_next_weight = None
-            
-            if consuming_layer_info is not None:
-                consuming_block, consuming_attr = consuming_layer_info
-                consuming_conv = getattr(consuming_block, consuming_attr)
-                original_next_weight = consuming_conv.weight.data.clone()
-                
-                # Add one zero-initialized input channel
-                new_input_channel = torch.zeros(
-                    consuming_conv.out_channels, 1,
-                    consuming_conv.kernel_size[0], consuming_conv.kernel_size[1],
-                    device=consuming_conv.weight.device
-                )
-                temp_weight = torch.cat([consuming_conv.weight.data, new_input_channel], dim=1)
-                consuming_conv.weight.data = temp_weight
-                consuming_conv.in_channels += 1
-            
-            # Forward and backward pass
-            self.zero_grad()
-            output = self.forward(batch_data)
-            loss = criterion(output, target_data)
-            loss.backward()
-            
-            # Calculate gradient norm for this candidate
-            if conv_layer.weight.grad is not None:
-                grad_norm = torch.norm(conv_layer.weight.grad[-1]).item()
-            else:
-                grad_norm = 0
-            gradient_norms.append(grad_norm)
-            
-            # Restore consuming layer
-            if consuming_layer_info is not None and original_next_weight is not None:
-                consuming_block, consuming_attr = consuming_layer_info
-                consuming_conv = getattr(consuming_block, consuming_attr)
-                consuming_conv.weight.data = original_next_weight
-                consuming_conv.in_channels -= 1
-            
-            # Restore original state for next candidate
-            conv_layer.out_channels = original_out_channels
-            conv_layer.weight = nn.Parameter(original_weight.clone())
-            if original_bias is not None:
-                conv_layer.bias = nn.Parameter(original_bias.clone())
-        
-        # Select winner
-        winner_idx = gradient_norms.index(max(gradient_norms))
-        winner_weights = candidates[winner_idx]
-        
-        return winner_weights, winner_idx
-
-    def grow_layer_split(self, layer_idx: str, conv_idx: int) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        """
-        Grow a layer using Gradient-Informed Splitting.
-        
-        Args:
-            layer_idx (str): Layer identifier
-            conv_idx (int): Which conv in the block (0 or 1)
-            
-        Returns:
-            split_filter_idx (int): Index of the filter that was split
-            new_filter1 (torch.Tensor): First half of split
-            new_filter2 (torch.Tensor): Second half of split (with noise)
-        """
-        # Get the target layer
-        if layer_idx == 'bottleneck':
-            block = self.conv
-        elif layer_idx.startswith('down_'):
-            idx = int(layer_idx.split('_')[1])
-            block = self.down_sample_layers[idx]
-        elif layer_idx.startswith('up_'):
-            idx = int(layer_idx.split('_')[1])
-            block = self.up_sample_layers[idx]
-        else:
-            raise ValueError(f"Invalid layer_idx: {layer_idx}")
-
-        conv_layer = block.conv1 if conv_idx == 0 else block.conv2
-        
-        # Find filter with largest gradient norm
-        if conv_layer.weight.grad is None:
-            raise ValueError("No gradients available. Run a forward-backward pass first.")
-        
+        # Find filter with largest gradient (most important)
         grad_norms = torch.norm(conv_layer.weight.grad.view(conv_layer.out_channels, -1), dim=1)
-        split_filter_idx = torch.argmax(grad_norms).item()
+        best_idx = torch.argmax(grad_norms).item()
         
-        # Get the filter to split
-        filter_to_split = conv_layer.weight.data[split_filter_idx:split_filter_idx+1].clone()
+        # Copy the best filter and add noise
+        new_filter = conv_layer.weight.data[best_idx:best_idx+1].clone()
+        noise = torch.randn_like(new_filter) * 0.01
+        new_filter = new_filter + noise
         
-        # Create two copies
-        new_filter1 = filter_to_split.clone()
-        new_filter2 = filter_to_split.clone()
-        
-        # Add small noise to break symmetry
-        noise = torch.randn_like(new_filter2) * 0.01
-        new_filter2 += noise
-        
-        return split_filter_idx, new_filter1, new_filter2
+        return new_filter
 
-    def apply_growth(self, layer_idx: str, conv_idx: int, new_filter: torch.Tensor,
-                     split_mode: bool = False):
+    def drop_channel(self, layer_id: str, block: nn.Module, conv_name: str, channel_idx: int):
         """
-        Apply the growth by permanently adding the new filter(s).
+        Drop a channel from a conv layer.
         
         Args:
-            layer_idx (str): Layer identifier
-            conv_idx (int): Which conv in the block (0 or 1)
-            new_filter (torch.Tensor): New filter(s) to add
-            split_mode (bool): If True, halve the next layer weights for the split filters
+            layer_id (str): Layer identifier
+            block (nn.Module): The conv block
+            conv_name (str): 'conv1' or 'conv2'
+            channel_idx (int): Index of channel to drop
         """
-        # Get the target block
-        if layer_idx == 'bottleneck':
-            block = self.conv
-        elif layer_idx.startswith('down_'):
-            idx = int(layer_idx.split('_')[1])
-            block = self.down_sample_layers[idx]
-        elif layer_idx.startswith('up_'):
-            idx = int(layer_idx.split('_')[1])
-            block = self.up_sample_layers[idx]
-        else:
-            raise ValueError(f"Invalid layer_idx: {layer_idx}")
-
-        conv_layer = block.conv1 if conv_idx == 0 else block.conv2
+        conv_layer = getattr(block, conv_name)
         
-        # Add new filter(s)
-        old_out_channels = conv_layer.out_channels
-        new_out_channels = old_out_channels + new_filter.size(0)
-        n_new_filters = new_filter.size(0)
+        # Create mask to keep all channels except the one to drop
+        keep_mask = torch.ones(conv_layer.out_channels, dtype=torch.bool)
+        keep_mask[channel_idx] = False
         
-        # Concatenate weights
-        new_weight = torch.cat([conv_layer.weight.data, new_filter], dim=0)
-        
-        # Update bias
-        if conv_layer.bias is not None:
-            new_bias_vals = torch.zeros(n_new_filters, device=conv_layer.bias.device)
-            new_bias = torch.cat([conv_layer.bias.data, new_bias_vals], dim=0)
-        else:
-            new_bias = None
-        
-        # Create new conv layer with updated size
+        # Create new smaller conv layer
+        new_out_channels = conv_layer.out_channels - 1
         new_conv = nn.Conv2d(
             conv_layer.in_channels,
             new_out_channels,
@@ -353,160 +263,155 @@ class DynamicUnetModel(nn.Module):
             bias=(conv_layer.bias is not None)
         ).to(conv_layer.weight.device)
         
-        new_conv.weight = nn.Parameter(new_weight)
-        if new_bias is not None:
-            new_conv.bias = nn.Parameter(new_bias)
+        # Copy weights (excluding dropped channel)
+        new_conv.weight.data = conv_layer.weight.data[keep_mask]
+        if conv_layer.bias is not None:
+            new_conv.bias.data = conv_layer.bias.data[keep_mask]
         
-        # Replace the layer
-        if conv_idx == 0:
-            block.conv1 = new_conv
-        else:
-            block.conv2 = new_conv
+        # Replace layer
+        setattr(block, conv_name, new_conv)
         
-        # Update normalization layers
-        if conv_idx == 0:
-            block.norm1 = nn.InstanceNorm2d(new_out_channels).to(conv_layer.weight.device)
-        else:
-            block.norm2 = nn.InstanceNorm2d(new_out_channels).to(conv_layer.weight.device)
+        # Update normalization layer
+        norm_name = conv_name.replace('conv', 'norm')
+        new_norm = nn.InstanceNorm2d(new_out_channels).to(conv_layer.weight.device)
+        setattr(block, norm_name, new_norm)
         
-        # Update tracked dimensions
+        # Update the layer that consumes this output
+        self._update_consuming_layer_drop(layer_id, conv_name, channel_idx)
+        
+        # Update block's tracked channels
         block.out_chans = new_out_channels
-        
-        # Update the next layer that consumes this output
-        self._update_consuming_layer(layer_idx, conv_idx, n_new_filters, split_mode)
-        
-    def _get_consuming_layer_info(self, layer_idx: str, conv_idx: int):
+
+    def add_channel(self, layer_id: str, block: nn.Module, conv_name: str, new_filter: torch.Tensor):
         """
-        Get information about which layer consumes the output of the specified layer.
+        Add a channel to a conv layer.
         
-        Returns:
-            Tuple of (consuming_block, consuming_conv_attr) or None
+        Args:
+            layer_id (str): Layer identifier
+            block (nn.Module): The conv block
+            conv_name (str): 'conv1' or 'conv2'
+            new_filter (torch.Tensor): New filter weights to add
         """
-        if conv_idx == 0:
-            # If we grew conv1, conv2 in the same block consumes it
-            if layer_idx == 'bottleneck':
-                return (self.conv, 'conv2')
-            elif layer_idx.startswith('down_'):
-                idx = int(layer_idx.split('_')[1])
-                return (self.down_sample_layers[idx], 'conv2')
-            elif layer_idx.startswith('up_'):
-                idx = int(layer_idx.split('_')[1])
-                return (self.up_sample_layers[idx], 'conv2')
-        else:
-            # If we grew conv2, the next block consumes it
-            if layer_idx == 'bottleneck':
-                return (self.up_sample_layers[0], 'conv1')
-            elif layer_idx.startswith('down_'):
-                idx = int(layer_idx.split('_')[1])
-                if idx < len(self.down_sample_layers) - 1:
-                    return (self.down_sample_layers[idx + 1], 'conv1')
-                else:
-                    return (self.conv, 'conv1')
-            elif layer_idx.startswith('up_'):
-                idx = int(layer_idx.split('_')[1])
-                if idx < len(self.up_sample_layers) - 1:
-                    return (self.up_sample_layers[idx + 1], 'conv1')
-                else:
-                    # Last up layer feeds into final conv - special case
-                    return None
-        return None
-    
-    def _update_consuming_layer(self, layer_idx: str, conv_idx: int, n_new_filters: int, split_mode: bool):
-        """Update the layer that consumes the output of the grown layer."""
+        conv_layer = getattr(block, conv_name)
         
-        # Determine which layer consumes this output
-        if conv_idx == 0:
-            # If we grew conv1, conv2 in the same block consumes it
-            if layer_idx == 'bottleneck':
-                consuming_block = self.conv
-                consuming_conv_attr = 'conv2'
-            elif layer_idx.startswith('down_'):
-                idx = int(layer_idx.split('_')[1])
-                consuming_block = self.down_sample_layers[idx]
-                consuming_conv_attr = 'conv2'
-            elif layer_idx.startswith('up_'):
-                idx = int(layer_idx.split('_')[1])
-                consuming_block = self.up_sample_layers[idx]
-                consuming_conv_attr = 'conv2'
-            else:
-                return
-        else:
-            # If we grew conv2, the next block consumes it
-            if layer_idx == 'bottleneck':
-                # Bottleneck conv2 feeds into first upsampling layer
-                consuming_block = self.up_sample_layers[0]
-                consuming_conv_attr = 'conv1'
-            elif layer_idx.startswith('down_'):
-                idx = int(layer_idx.split('_')[1])
-                if idx < len(self.down_sample_layers) - 1:
-                    # Feeds into next downsampling layer
-                    consuming_block = self.down_sample_layers[idx + 1]
-                    consuming_conv_attr = 'conv1'
-                else:
-                    # Last downsampling layer feeds into bottleneck
-                    consuming_block = self.conv
-                    consuming_conv_attr = 'conv1'
-            elif layer_idx.startswith('up_'):
-                idx = int(layer_idx.split('_')[1])
-                if idx < len(self.up_sample_layers) - 1:
-                    # Feeds into next upsampling layer
-                    consuming_block = self.up_sample_layers[idx + 1]
-                    consuming_conv_attr = 'conv1'
-                else:
-                    # Last upsampling layer feeds into final conv
-                    # For simplicity, we'll handle this separately
-                    # The conv2 sequential layers need updating
-                    self._update_final_layers(n_new_filters)
-                    return
-            else:
-                return
-        
-        # Get the consuming conv layer
-        consuming_conv = getattr(consuming_block, consuming_conv_attr)
-        old_weight = consuming_conv.weight.data
-        
-        # Create new input channels (zero-initialized for silent addition)
-        new_weight_part = torch.zeros(
-            consuming_conv.out_channels, n_new_filters,
-            consuming_conv.kernel_size[0], consuming_conv.kernel_size[1],
-            device=old_weight.device
-        )
-        
-        # Concatenate along input channel dimension
-        new_weight = torch.cat([old_weight, new_weight_part], dim=1)
-        
-        # Create new conv layer
+        # Create new larger conv layer
+        new_out_channels = conv_layer.out_channels + 1
         new_conv = nn.Conv2d(
-            consuming_conv.in_channels + n_new_filters,
+            conv_layer.in_channels,
+            new_out_channels,
+            kernel_size=conv_layer.kernel_size,
+            stride=conv_layer.stride,
+            padding=conv_layer.padding,
+            bias=(conv_layer.bias is not None)
+        ).to(conv_layer.weight.device)
+        
+        # Copy old weights and append new filter
+        new_conv.weight.data = torch.cat([conv_layer.weight.data, new_filter], dim=0)
+        
+        if conv_layer.bias is not None:
+            new_bias_val = torch.zeros(1, device=conv_layer.bias.device)
+            new_conv.bias.data = torch.cat([conv_layer.bias.data, new_bias_val], dim=0)
+        
+        # Replace layer
+        setattr(block, conv_name, new_conv)
+        
+        # Update normalization layer
+        norm_name = conv_name.replace('conv', 'norm')
+        new_norm = nn.InstanceNorm2d(new_out_channels).to(conv_layer.weight.device)
+        setattr(block, norm_name, new_norm)
+        
+        # Update the layer that consumes this output
+        self._update_consuming_layer_add(layer_id, conv_name)
+        
+        # Update block's tracked channels
+        block.out_chans = new_out_channels
+
+    def _update_consuming_layer_drop(self, layer_id: str, conv_name: str, dropped_idx: int):
+        """Update the consuming layer when a channel is dropped."""
+        consuming_info = self._get_consuming_layer(layer_id, conv_name)
+        if consuming_info is None:
+            # Special case: last up layer feeds into final conv2 Sequential
+            if layer_id.startswith('up_') and conv_name == 'conv2':
+                idx = int(layer_id.split('_')[1])
+                if idx == len(self.up_sample_layers) - 1:
+                    # Update the first layer in self.conv2 Sequential
+                    self._update_final_layers_drop(dropped_idx)
+            return
+        
+        consuming_block, consuming_conv_name = consuming_info
+        consuming_conv = getattr(consuming_block, consuming_conv_name)
+        
+        # Create mask to keep all input channels except the dropped one
+        keep_mask = torch.ones(consuming_conv.in_channels, dtype=torch.bool)
+        keep_mask[dropped_idx] = False
+        
+        # Create new conv with one less input channel
+        new_conv = nn.Conv2d(
+            consuming_conv.in_channels - 1,
             consuming_conv.out_channels,
             kernel_size=consuming_conv.kernel_size,
             stride=consuming_conv.stride,
             padding=consuming_conv.padding,
             bias=(consuming_conv.bias is not None)
-        ).to(old_weight.device)
+        ).to(consuming_conv.weight.device)
         
-        new_conv.weight = nn.Parameter(new_weight)
+        # Copy weights (excluding the input channel that was dropped)
+        new_conv.weight.data = consuming_conv.weight.data[:, keep_mask, :, :]
         if consuming_conv.bias is not None:
-            new_conv.bias = nn.Parameter(consuming_conv.bias.data.clone())
+            new_conv.bias.data = consuming_conv.bias.data.clone()
         
-        # Replace the layer
-        setattr(consuming_block, consuming_conv_attr, new_conv)
+        # Replace layer
+        setattr(consuming_block, consuming_conv_name, new_conv)
+
+    def _update_consuming_layer_add(self, layer_id: str, conv_name: str):
+        """Update the consuming layer when a channel is added (zero-initialized for silent addition)."""
+        consuming_info = self._get_consuming_layer(layer_id, conv_name)
+        if consuming_info is None:
+            # Special case: last up layer feeds into final conv2 Sequential
+            if layer_id.startswith('up_') and conv_name == 'conv2':
+                idx = int(layer_id.split('_')[1])
+                if idx == len(self.up_sample_layers) - 1:
+                    # Update the first layer in self.conv2 Sequential
+                    self._update_final_layers_add()
+            return
         
-        # Update the norm layer if it's norm1 (since we updated conv1)
-        if consuming_conv_attr == 'conv1':
-            # We don't need to update norm1 since it takes conv1's output, not input
-            pass
-    
-    def _update_final_layers(self, n_new_filters: int):
-        """Update the final conv2 sequential layers when last up layer grows."""
+        consuming_block, consuming_conv_name = consuming_info
+        consuming_conv = getattr(consuming_block, consuming_conv_name)
+        
+        # Create new conv with one more input channel
+        new_conv = nn.Conv2d(
+            consuming_conv.in_channels + 1,
+            consuming_conv.out_channels,
+            kernel_size=consuming_conv.kernel_size,
+            stride=consuming_conv.stride,
+            padding=consuming_conv.padding,
+            bias=(consuming_conv.bias is not None)
+        ).to(consuming_conv.weight.device)
+        
+        # Copy old weights and append zero-initialized weights for new input channel
+        zero_channel = torch.zeros(
+            consuming_conv.out_channels, 1,
+            consuming_conv.kernel_size[0], consuming_conv.kernel_size[1],
+            device=consuming_conv.weight.device
+        )
+        new_conv.weight.data = torch.cat([consuming_conv.weight.data, zero_channel], dim=1)
+        
+        if consuming_conv.bias is not None:
+            new_conv.bias.data = consuming_conv.bias.data.clone()
+        
+        # Replace layer
+        setattr(consuming_block, consuming_conv_name, new_conv)
+
+    def _update_final_layers_add(self):
+        """Update the final conv2 Sequential layers when a channel is added to the last up layer."""
         # The conv2 Sequential consists of three Conv2d layers
         # We only need to update the first one which takes the upsampled features
         first_conv = self.conv2[0]
         old_weight = first_conv.weight.data
         
-        # Add new input channels (zero-initialized)
+        # Add new input channel (zero-initialized for silent addition)
         new_weight_part = torch.zeros(
-            first_conv.out_channels, n_new_filters,
+            first_conv.out_channels, 1,
             first_conv.kernel_size[0], first_conv.kernel_size[1],
             device=old_weight.device
         )
@@ -515,7 +420,7 @@ class DynamicUnetModel(nn.Module):
         
         # Create new conv
         new_conv = nn.Conv2d(
-            first_conv.in_channels + n_new_filters,
+            first_conv.in_channels + 1,
             first_conv.out_channels,
             kernel_size=first_conv.kernel_size,
             stride=first_conv.stride,
@@ -523,57 +428,156 @@ class DynamicUnetModel(nn.Module):
             bias=(first_conv.bias is not None)
         ).to(old_weight.device)
         
-        new_conv.weight = nn.Parameter(new_weight)
+        new_conv.weight.data = new_weight
         if first_conv.bias is not None:
-            new_conv.bias = nn.Parameter(first_conv.bias.data.clone())
+            new_conv.bias.data = first_conv.bias.data.clone()
+        
+        # Replace in Sequential
+        self.conv2[0] = new_conv
+    
+    def _update_final_layers_drop(self, dropped_idx: int):
+        """Update the final conv2 Sequential layers when a channel is dropped from the last up layer."""
+        first_conv = self.conv2[0]
+        old_weight = first_conv.weight.data
+        
+        # Create mask to keep all input channels except the dropped one
+        keep_mask = torch.ones(first_conv.in_channels, dtype=torch.bool)
+        keep_mask[dropped_idx] = False
+        
+        # Create new conv with one less input channel
+        new_conv = nn.Conv2d(
+            first_conv.in_channels - 1,
+            first_conv.out_channels,
+            kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride,
+            padding=first_conv.padding,
+            bias=(first_conv.bias is not None)
+        ).to(old_weight.device)
+        
+        # Copy weights (excluding dropped input channel)
+        new_conv.weight.data = old_weight[:, keep_mask, :, :]
+        if first_conv.bias is not None:
+            new_conv.bias.data = first_conv.bias.data.clone()
         
         # Replace in Sequential
         self.conv2[0] = new_conv
 
-    def grow_network(self, layer_idx: str, conv_idx: int, batch_data: torch.Tensor,
-                     target_data: torch.Tensor, criterion):
+    def _get_consuming_layer(self, layer_id: str, conv_name: str) -> Tuple[nn.Module, str]:
         """
-        Grow the network by adding one filter to the specified layer.
+        Get the layer that consumes the output of the specified layer.
         
-        Args:
-            layer_idx (str): Layer identifier
-            conv_idx (int): Which conv in the block (0 or 1)
-            batch_data (torch.Tensor): Input batch for gradient calculation
-            target_data (torch.Tensor): Target batch for loss calculation
-            criterion: Loss function
+        Returns:
+            Tuple of (consuming_block, consuming_conv_name) or None
         """
-        if self.growth_method == 'sample_select':
-            winner_weights, winner_idx = self.grow_layer_sample_select(
-                layer_idx, conv_idx, batch_data, target_data, criterion
-            )
-            print(f"Growing {layer_idx} conv{conv_idx}: Selected candidate {winner_idx}")
-            self.apply_growth(layer_idx, conv_idx, winner_weights, split_mode=False)
-            
-        elif self.growth_method == 'split':
-            split_idx, filter1, filter2 = self.grow_layer_split(layer_idx, conv_idx)
-            print(f"Growing {layer_idx} conv{conv_idx}: Split filter {split_idx}")
-            new_filters = torch.cat([filter1, filter2], dim=0)
-            self.apply_growth(layer_idx, conv_idx, new_filters, split_mode=True)
+        if conv_name == 'conv1':
+            # conv2 in the same block consumes conv1
+            if layer_id == 'bottleneck':
+                return (self.conv, 'conv2')
+            elif layer_id.startswith('down_'):
+                idx = int(layer_id.split('_')[1])
+                return (self.down_sample_layers[idx], 'conv2')
+            elif layer_id.startswith('up_'):
+                idx = int(layer_id.split('_')[1])
+                return (self.up_sample_layers[idx], 'conv2')
         
-        else:
-            raise ValueError(f"Unknown growth method: {self.growth_method}")
+        elif conv_name == 'conv2':
+            # Next block's conv1 consumes conv2
+            if layer_id == 'bottleneck':
+                return (self.up_sample_layers[0], 'conv1')
+            elif layer_id.startswith('down_'):
+                idx = int(layer_id.split('_')[1])
+                if idx < len(self.down_sample_layers) - 1:
+                    return (self.down_sample_layers[idx + 1], 'conv1')
+                else:
+                    return (self.conv, 'conv1')
+            elif layer_id.startswith('up_'):
+                idx = int(layer_id.split('_')[1])
+                if idx < len(self.up_sample_layers) - 1:
+                    return (self.up_sample_layers[idx + 1], 'conv1')
+                else:
+                    # Last up layer - special case, would need to update final conv
+                    return None
+        
+        return None
 
-    def get_network_size(self) -> dict:
+    def perform_channel_swap(self):
+        """
+        Perform one channel swap: drop from one layer, add to another.
+        This keeps the total parameter count approximately constant.
+        """
+        swappable_layers = self.get_swappable_layers()
+        
+        if len(swappable_layers) < 2:
+            print("Not enough layers to swap")
+            return
+        
+        # Randomly select two different layers
+        drop_layer_info = random.choice(swappable_layers)
+        add_layer_info = random.choice([l for l in swappable_layers if l != drop_layer_info])
+        
+        drop_id, drop_block, drop_conv = drop_layer_info
+        add_id, add_block, add_conv = add_layer_info
+        
+        drop_conv_layer = getattr(drop_block, drop_conv)
+        add_conv_layer = getattr(add_block, add_conv)
+        
+        # Make sure we don't drop below minimum channels
+        if drop_conv_layer.out_channels <= 2:
+            print(f"Skipping swap: {drop_id}.{drop_conv} has too few channels ({drop_conv_layer.out_channels})")
+            return
+        
+        # Find channel to drop (lowest gradient)
+        channel_to_drop = self.find_channel_to_drop(drop_id, drop_block, drop_conv)
+        
+        # Find channel to add (gradient-informed)
+        new_filter = self.find_channel_to_add(add_id, add_block, add_conv)
+        
+        print(f"\n=== Channel Swap ===")
+        print(f"Dropping channel {channel_to_drop} from {drop_id}.{drop_conv} "
+              f"({drop_conv_layer.out_channels} → {drop_conv_layer.out_channels - 1})")
+        print(f"Adding channel to {add_id}.{add_conv} "
+              f"({add_conv_layer.out_channels} → {add_conv_layer.out_channels + 1})")
+        
+        # Perform the swap
+        self.drop_channel(drop_id, drop_block, drop_conv, channel_to_drop)
+        self.add_channel(add_id, add_block, add_conv, new_filter)
+        
+        print(f"Swap complete!\n")
+
+    def maybe_swap_channels(self):
+        """
+        Check if it's time to swap channels (every swap_frequency batches).
+        Call this after each training batch.
+        """
+        self.batch_counter += 1
+        
+        if self.batch_counter % self.swap_frequency == 0:
+            print(f"\n[Batch {self.batch_counter}] Performing channel swap...")
+            self.perform_channel_swap()
+
+    def get_network_size(self) -> Dict:
         """Get current size of the network (number of channels per layer)."""
         sizes = {}
+        
         for i, layer in enumerate(self.down_sample_layers):
             sizes[f'down_{i}'] = {
                 'conv1_out': layer.conv1.out_channels,
                 'conv2_out': layer.conv2.out_channels
             }
+        
         sizes['bottleneck'] = {
             'conv1_out': self.conv.conv1.out_channels,
             'conv2_out': self.conv.conv2.out_channels
         }
+        
         for i, layer in enumerate(self.up_sample_layers):
             sizes[f'up_{i}'] = {
                 'conv1_out': layer.conv1.out_channels,
                 'conv2_out': layer.conv2.out_channels
             }
+        
         return sizes
 
+    def count_parameters(self) -> int:
+        """Count total number of parameters in the model."""
+        return sum(p.numel() for p in self.parameters())

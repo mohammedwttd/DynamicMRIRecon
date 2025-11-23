@@ -6,6 +6,12 @@ import fastmri.models
 from models.rec_models.unet_model import UnetModel
 from models.rec_models.complex_unet import ComplexUnetModel
 from models.rec_models.dynamic_unet_model import DynamicUnetModel
+from models.rec_models.cond_unet_model import CondUnetModel
+from models.rec_models.hybrid_cond_unet import HybridCondUnetModel
+from models.rec_models.small_cond_unet import SmallCondUnetModel
+from models.rec_models.fd_unet_model import FDUnetModel
+from models.rec_models.hybrid_snake_fd_unet import HybridSnakeFDUnet
+from models.rec_models.dcn_fd_unet import DCNFDUnet
 import data.transforms as transforms
 from pytorch_nufft.nufft import nufft, nufft_adjoint
 import numpy as np
@@ -398,7 +404,8 @@ class Subsampling_Model(nn.Module):
                  trajectory_learning, initialization, n_shots, interp_gap, SNR=False, type=None,
                  img_size=(320, 320) ,window_size=10, embed_dim=66, num_blocks=1, sample_per_shot=3001,
                  epsilon = 0, epsilon_step = None, noise_p = 0, std = 0, acceleration=4, center_fraction=0.08, noise ="", epochs = 40,
-                 growth_method='sample_select', n_candidates=10, growth_interval=10, layers_to_grow=None):
+                 swap_frequency=10, num_experts=8, fd_kernel_num=64, fd_use_simple=False,
+                 snake_layers=2, snake_kernel_size=9):
         super().__init__()
         self.type = type
         self.noise_model = NoiseScheduler(epsilon,warmup_steps=4, total_steps=epochs, final_noise=0, constant_steps=0, mode = noise)
@@ -440,11 +447,33 @@ class Subsampling_Model(nn.Module):
             self.reconstruction_model = UnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob)
         elif type == 'DynamicUnet':
             self.reconstruction_model = DynamicUnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob,
-                                                          growth_method=growth_method, n_candidates=n_candidates)
-            # Store growth parameters
-            self.growth_interval = growth_interval
-            self.layers_to_grow = layers_to_grow if layers_to_grow else ['bottleneck']
-            self.growth_enabled = True
+                                                          swap_frequency=swap_frequency)
+        elif type == 'CondUnet':
+            self.reconstruction_model = CondUnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                                                       num_experts=num_experts)
+        elif type == 'HybridCondUnet':
+            # Use 80% of regular channels to keep params lower
+            hybrid_chans = int(chans * 0.8)
+            self.reconstruction_model = HybridCondUnetModel(in_chans, out_chans, hybrid_chans, num_pool_layers, 
+                                                             drop_prob, num_experts=num_experts)
+        elif type == 'SmallCondUnet':
+            # Use ~55% of regular channels to compensate for CondConv overhead
+            small_chans = int(chans * 0.55)
+            self.reconstruction_model = SmallCondUnetModel(in_chans, out_chans, small_chans, num_pool_layers,
+                                                            drop_prob, num_experts=num_experts)
+        elif type == 'FDUnet':
+            self.reconstruction_model = FDUnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                                                     kernel_num=fd_kernel_num, use_simple=fd_use_simple)
+        elif type == 'HybridSnakeFDUnet' or type == 'SmallHybridSnakeFDUnet':
+            self.reconstruction_model = HybridSnakeFDUnet(in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                                                          snake_layers=snake_layers, 
+                                                          snake_kernel_size=snake_kernel_size,
+                                                          fd_kernel_num=fd_kernel_num, 
+                                                          fd_use_simple=fd_use_simple)
+        elif type == 'DCNFDUnet' or type == 'SmallDCNFDUnet':
+            self.reconstruction_model = DCNFDUnet(in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                                                  fd_kernel_num=fd_kernel_num, 
+                                                  fd_use_simple=fd_use_simple)
         elif type == 'humus':
             HUMUSReconstructionNet = HUMUSBlock(img_size=img_size, in_chans =in_chans, out_chans = out_chans, num_blocks = num_blocks, window_size = window_size, embed_dim = embed_dim)
             self.reconstruction_model = HUMUSReconstructionNet
@@ -457,7 +486,7 @@ class Subsampling_Model(nn.Module):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
-        elif self.type == 'Unet' or self.type == 'DynamicUnet':
+        elif self.type in ['Unet', 'DynamicUnet', 'CondUnet', 'HybridCondUnet', 'SmallCondUnet', 'FDUnet', 'HybridSnakeFDUnet', 'SmallHybridSnakeFDUnet', 'DCNFDUnet', 'SmallDCNFDUnet']:
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
@@ -480,56 +509,23 @@ class Subsampling_Model(nn.Module):
     def increase_noise_linearly(self):
         self.subsampling.increase_noise_linearly()
     
-    def grow_network_if_needed(self, epoch, batch_data, target_data, criterion):
+    def get_channel_swap_info(self):
         """
-        Grow the Dynamic U-Net if conditions are met.
-        
-        Args:
-            epoch: Current epoch number
-            batch_data: Batch for gradient calculation
-            target_data: Target batch for loss calculation
-            criterion: Loss function
+        Get information about the Dynamic U-Net's channel swapping.
         
         Returns:
-            bool: True if growth occurred
+            dict: Information about the model (e.g., batch counter, network size)
         """
-        if self.type != 'DynamicUnet' or not hasattr(self, 'growth_enabled'):
-            return False
+        if self.type != 'DynamicUnet':
+            return None
         
-        if not self.growth_enabled:
-            return False
-        
-        # Check if it's time to grow
-        if (epoch + 1) % self.growth_interval != 0 or epoch == 0:
-            return False
-        
-        print(f"\n{'='*60}")
-        print(f"Growing network at epoch {epoch + 1}")
-        print(f"{'='*60}")
-        
-        # Grow each specified layer
-        for layer_idx in self.layers_to_grow:
-            try:
-                self.reconstruction_model.grow_network(
-                    layer_idx=layer_idx,
-                    conv_idx=1,  # Grow second conv in the block
-                    batch_data=batch_data,
-                    target_data=target_data,
-                    criterion=criterion
-                )
-                print(f"  Grew layer: {layer_idx}")
-            except Exception as e:
-                print(f"  Failed to grow {layer_idx}: {e}")
-        
-        # Print new network size
-        new_size = self.reconstruction_model.get_network_size()
-        print(f"\nNew network size:")
-        for layer_name, sizes in new_size.items():
-            if layer_name in self.layers_to_grow or layer_name == 'bottleneck':
-                print(f"  {layer_name}: {sizes}")
-        print(f"{'='*60}\n")
-        
-        return True
+        info = {
+            'batch_counter': self.reconstruction_model.batch_counter,
+            'swap_frequency': self.reconstruction_model.swap_frequency,
+            'network_size': self.reconstruction_model.get_network_size(),
+            'total_parameters': self.reconstruction_model.count_parameters()
+        }
+        return info
     
     def get_network_size(self):
         """Get current size of the reconstruction network."""

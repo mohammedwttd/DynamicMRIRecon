@@ -106,7 +106,7 @@ def create_datasets(args):
     dev_data = SliceData(
         root=args.data_path / f'multicoil_val',
         transform=DataTransform(args.resolution),
-        sample_rate=0.1)
+        sample_rate=1)
 
     return dev_data, train_data
 
@@ -454,6 +454,13 @@ def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, write
         if args.initialization == 'cartesian':
             model.module.subsampling.apply_binary_grad(optimizer_sub.param_groups[0]['lr'])
         model.module.subsampling.attack_trajectory = None
+        
+        # Dynamic U-Net: perform channel swap if it's time
+        if args.model == 'DynamicUnet':
+            try:
+                model.module.reconstruction_model.maybe_swap_channels()
+            except Exception as e:
+                logging.warning(f"Failed to perform channel swap at iteration {iter}: {e}")
 
         avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if iter > 0 else loss.item()
         # writer.add_scalar('TrainLoss', loss.item(), global_step + iter)
@@ -637,7 +644,80 @@ def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss,
         shutil.copyfile(exp_dir + '/model.pt', exp_dir + '/best_model.pt')
 
 
+def calculate_model_flops(model, input_shape=(1, 1, 320, 320, 2), device='cuda'):
+    """
+    Calculate FLOPs for the model using available libraries.
+    
+    Args:
+        model: PyTorch model
+        input_shape: Input tensor shape (B, C, H, W, 2) for complex images
+        device: Device to run on
+    
+    Returns:
+        tuple: (flops, macs, method_used)
+    """
+    # Try thop first (most compatible)
+    try:
+        from thop import profile
+        model.eval()
+        inputs = torch.randn(input_shape).to(device)
+        with torch.no_grad():
+            macs, params = profile(model, inputs=(inputs,), verbose=False)
+        model.train()
+        flops = macs * 2  # FLOPs ≈ 2 × MACs
+        return flops, macs, 'thop'
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # Try fvcore
+    try:
+        from fvcore.nn import FlopCountAnalysis
+        model.eval()
+        inputs = torch.randn(input_shape).to(device)
+        with torch.no_grad():
+            flops_counter = FlopCountAnalysis(model, inputs)
+            flops = flops_counter.total()
+        model.train()
+        macs = flops / 2
+        return flops, macs, 'fvcore'
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # Try ptflops
+    try:
+        from ptflops import get_model_complexity_info
+        # ptflops doesn't handle complex 5D tensors well, skip
+        pass
+    except ImportError:
+        pass
+    
+    return None, None, None
+
+
+def format_flops(num):
+    """Format FLOPs in human-readable format."""
+    if num is None:
+        return "N/A"
+    if num >= 1e12:
+        return f"{num/1e12:.2f} TFLOPs"
+    elif num >= 1e9:
+        return f"{num/1e9:.2f} GFLOPs"
+    elif num >= 1e6:
+        return f"{num/1e6:.2f} MFLOPs"
+    elif num >= 1e3:
+        return f"{num/1e3:.2f} KFLOPs"
+    else:
+        return f"{num:.2f} FLOPs"
+
+
 def build_model(args):
+    print("\n" + "=" * 80)
+    print(f"Building model: {args.model}")
+    print("=" * 80)
 
     model = Subsampling_Model(
         in_chans=args.in_chans,
@@ -666,11 +746,44 @@ def build_model(args):
         noise = args.noise_behaviour,
         epochs = args.num_epochs,
         # Dynamic U-Net parameters
-        growth_method=args.growth_method if hasattr(args, 'growth_method') else 'sample_select',
-        n_candidates=args.n_candidates if hasattr(args, 'n_candidates') else 10,
-        growth_interval=args.growth_interval if hasattr(args, 'growth_interval') else 10,
-        layers_to_grow=args.layers_to_grow if hasattr(args, 'layers_to_grow') else ['bottleneck'],
+        swap_frequency=args.swap_frequency if hasattr(args, 'swap_frequency') else 10,
+        # CondUnet parameters
+        num_experts=args.num_experts if hasattr(args, 'num_experts') else 8,
+        # FDUnet parameters
+        fd_kernel_num=args.fd_kernel_num if hasattr(args, 'fd_kernel_num') else 64,
+        fd_use_simple=args.fd_use_simple if hasattr(args, 'fd_use_simple') else False,
+        # HybridSnakeFDUnet parameters
+        snake_layers=args.snake_layers if hasattr(args, 'snake_layers') else 2,
+        snake_kernel_size=args.snake_kernel_size if hasattr(args, 'snake_kernel_size') else 9,
     ).to(args.device)
+    
+    # Count and display parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    recon_params = sum(p.numel() for p in model.reconstruction_model.parameters() if p.requires_grad)
+    subsampling_params = total_params - recon_params
+    
+    print(f"\n📊 Parameter Count:")
+    print(f"  Reconstruction Model: {recon_params:,} parameters ({recon_params/1e6:.2f}M)")
+    print(f"  Subsampling Model:    {subsampling_params:,} parameters ({subsampling_params/1e6:.2f}M)")
+    print(f"  Total:                {total_params:,} parameters ({total_params/1e6:.2f}M)")
+    print(f"  Model size:           {total_params * 4 / (1024**2):.2f} MB (float32)")
+    
+    # Calculate and display FLOPs
+    print(f"\n⚡ Computational Complexity:")
+    input_shape = (1, 1, 320, 320, 2)  # Standard input shape for MRI
+    flops, macs, method = calculate_model_flops(model, input_shape, args.device)
+    
+    if flops is not None:
+        print(f"  FLOPs:  {format_flops(flops)} ({flops:,})")
+        print(f"  MACs:   {format_flops(macs)} ({macs:,})")
+        print(f"  Method: {method}")
+        print(f"  Input:  {input_shape[0]}×{input_shape[1]}×{input_shape[2]}×{input_shape[3]}×{input_shape[4]}")
+    else:
+        print(f"  FLOPs calculation unavailable (install 'thop' or 'fvcore')")
+        print(f"  To enable: pip install thop")
+    
+    print("=" * 80 + "\n")
+    
     return model
 
 
@@ -812,48 +925,8 @@ def train():
             model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
         train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask)
         
-        # Dynamic U-Net growth (if applicable)
-        # Safety check: don't grow too frequently (minimum 5 epochs between growths)
-        min_growth_interval = max(args.growth_interval if hasattr(args, 'growth_interval') else 10, 5)
-        if args.model == 'DynamicUnet' and epoch > 0 and (epoch % min_growth_interval == 0):
-            try:
-                # Get a sample batch for gradient calculation
-                sample_iter = iter(train_loader)
-                sample_batch = next(sample_iter)
-                input_data, target_data, _, _, _ = sample_batch
-                input_data = input_data.to(args.device)
-                target_data = target_data.to(args.device)
-                
-                # Prepare data for growth (process through full forward pass to get reconstructed output)
-                with torch.no_grad():
-                    # Get the subsampled and reconstructed data
-                    if args.data_parallel:
-                        subsampled_input = model.module.subsampling(input_data)
-                    else:
-                        subsampled_input = model.subsampling(input_data)
-                
-                # Define a simple criterion for growth
-                criterion = torch.nn.MSELoss()
-                
-                # Attempt growth - use the subsampled input and target
-                if args.data_parallel:
-                    growth_occurred = model.module.grow_network_if_needed(
-                        epoch, subsampled_input, target_data, criterion
-                    )
-                else:
-                    growth_occurred = model.grow_network_if_needed(
-                        epoch, subsampled_input, target_data, criterion
-                    )
-                
-                # If growth occurred, reset optimizer to include new parameters
-                if growth_occurred:
-                    optimizer, optimizer_sub = build_optim(args, model)
-                    scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
-                    logging.info(f"Optimizer reset after network growth at epoch {epoch}")
-            except Exception as e:
-                logging.warning(f"Failed to perform network growth at epoch {epoch}: {e}")
-                import traceback
-                traceback.print_exc()
+        # Dynamic U-Net: channel swapping happens automatically during training batches
+        # (see train_epoch function where maybe_swap_channels() is called)
         
         dev_loss, dev_time, psnr_mean, ssim_mean = evaluate(args, epoch + 1, model, dev_loader, writer, adv_mask)
         metrics += (dev_loss, dev_time, psnr_mean, ssim_mean)
@@ -943,14 +1016,24 @@ def create_arg_parser():
                         help='the model type and params of the reconstruction net')
     
     # Dynamic U-Net parameters
-    parser.add_argument('--growth-method', type=str, default='sample_select', choices=['sample_select', 'split'],
-                        help='Growth method for Dynamic U-Net: sample_select or split')
-    parser.add_argument('--n-candidates', type=int, default=10,
-                        help='Number of candidates to try for sample_select growth method')
-    parser.add_argument('--growth-interval', type=int, default=10,
-                        help='Grow network every N epochs (for DynamicUnet)')
-    parser.add_argument('--layers-to-grow', type=str, nargs='+', default=['bottleneck'],
-                        help='Which layers to grow (e.g., bottleneck down_3 up_0)')
+    parser.add_argument('--swap-frequency', type=int, default=10,
+                        help='Perform channel swap every N batches (for DynamicUnet)')
+    
+    # CondUnet parameters
+    parser.add_argument('--num-experts', type=int, default=8,
+                        help='Number of expert kernels per CondConv layer (for CondUnet)')
+    
+    # FDUnet parameters
+    parser.add_argument('--fd-kernel-num', type=int, default=64,
+                        help='Number of frequency-diverse kernels (for FDUnet)')
+    parser.add_argument('--fd-use-simple', action='store_true', default=False,
+                        help='Use simplified FDConv for faster computation (for FDUnet)')
+    
+    # HybridSnakeFDUnet parameters
+    parser.add_argument('--snake-layers', type=int, default=2,
+                        help='Number of encoder layers to use Snake Conv (for HybridSnakeFDUnet)')
+    parser.add_argument('--snake-kernel-size', type=int, default=9,
+                        help='Kernel size for Snake Convolution (for HybridSnakeFDUnet)')
     
     parser.add_argument('--inter-gap-mode', type=str, default='constant',
                         help='How the interpolated gap will change during the training')
