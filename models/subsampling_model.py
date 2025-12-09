@@ -3,23 +3,25 @@ from torch import nn
 from torch.nn import functional as F
 import json
 import fastmri.models
-from models.rec_models.unet_model import UnetModel
-from models.rec_models.complex_unet import ComplexUnetModel
-from models.rec_models.dynamic_unet_model import DynamicUnetModel
-from models.rec_models.cond_unet_model import CondUnetModel
-from models.rec_models.hybrid_cond_unet import HybridCondUnetModel
-from models.rec_models.small_cond_unet import SmallCondUnetModel
-from models.rec_models.fd_unet_model import FDUnetModel
-from models.rec_models.hybrid_snake_fd_unet import HybridSnakeFDUnet
-from models.rec_models.dcn_fd_unet import DCNFDUnet
+from models.rec_models.models.unet_model import UnetModel
+from models.rec_models.models.complex_unet import ComplexUnetModel
+from models.rec_models.models.dynamic_unet_model import DynamicUnetModel
+from models.rec_models.models.cond_unet_model import CondUnetModel
+from models.rec_models.models.hybrid_cond_unet import HybridCondUnetModel
+from models.rec_models.models.small_cond_unet import SmallCondUnetModel
+from models.rec_models.models.fd_unet_model import FDUnetModel
+from models.rec_models.models.hybrid_snake_fd_unet import HybridSnakeFDUnet
+from models.rec_models.models.dcn_fd_unet import DCNFDUnet, ConfigurableUNet, FullFDUnet
+from models.rec_models.static_sparse_unet import StaticSparseUNet
 import data.transforms as transforms
 from pytorch_nufft.nufft import nufft, nufft_adjoint
 import numpy as np
 from WaveformProjection.run_projection import proj_handler
 import matplotlib.pylab as P
-from models.rec_models.vision_transformer import VisionTransformer
-from models.rec_models.recon_net import ReconNet
-from models.rec_models.humus_net import HUMUSNet, HUMUSBlock
+from models.rec_models.models.vision_transformer import VisionTransformer
+from models.rec_models.models.recon_net import ReconNet
+from models.rec_models.models.humus_net import HUMUSNet
+from models.rec_models.models.humus_block import HUMUSBlock
 from  models.VarBlock import VarNet
 from typing import Tuple
 from fastmri.data.subsample import create_mask_for_mask_type
@@ -405,7 +407,7 @@ class Subsampling_Model(nn.Module):
                  img_size=(320, 320) ,window_size=10, embed_dim=66, num_blocks=1, sample_per_shot=3001,
                  epsilon = 0, epsilon_step = None, noise_p = 0, std = 0, acceleration=4, center_fraction=0.08, noise ="", epochs = 40,
                  swap_frequency=10, num_experts=8, fd_kernel_num=64, fd_use_simple=False,
-                 snake_layers=2, snake_kernel_size=9):
+                 snake_layers=2, snake_kernel_size=9, use_dcn=False, use_fdconv=False):
         super().__init__()
         self.type = type
         self.noise_model = NoiseScheduler(epsilon,warmup_steps=4, total_steps=epochs, final_noise=0, constant_steps=0, mode = noise)
@@ -443,7 +445,8 @@ class Subsampling_Model(nn.Module):
             )
             self.reconstruction_model = ReconNet(vitNet)
 
-        elif type == 'Unet':
+        elif type == 'Unet' or (type.startswith('UnetMasked') and type[10:].isdigit()) or (type.startswith('UnetMaskedDecoder') and type[17:].isdigit()):
+            # UnetMasked{X} and UnetMaskedDecoder{X} use standard UNet architecture, masks are applied during training
             self.reconstruction_model = UnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob)
         elif type == 'DynamicUnet':
             self.reconstruction_model = DynamicUnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob,
@@ -474,6 +477,128 @@ class Subsampling_Model(nn.Module):
             self.reconstruction_model = DCNFDUnet(in_chans, out_chans, chans, num_pool_layers, drop_prob,
                                                   fd_kernel_num=fd_kernel_num, 
                                                   fd_use_simple=fd_use_simple)
+        elif type in ['FullFDUnet', 'FullFD', 'LightFullFD', 'FullFDDCN']:
+            # Full FDConv U-Net: ALL conv blocks use FDConv
+            self.reconstruction_model = FullFDUnet(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                use_dcn=use_dcn,
+                fd_kernel_num=fd_kernel_num
+            )
+        elif type in ['HybridFDUnet', 'HybridFD', 'HybridFDDCN']:
+            # Hybrid FDConv U-Net: FDConv only at deeper levels (L2+)
+            # Early levels preserve edges, deep levels capture global frequency patterns
+            from models.rec_models.models.dcn_fd_unet import HybridFDUnet
+            self.reconstruction_model = HybridFDUnet(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                use_dcn=use_dcn,
+                fd_kernel_num=fd_kernel_num,
+                fd_start_level=2  # Levels 0,1: StandardConv | Levels 2,3+bottleneck: FDConv
+            )
+        elif type in ['DeepFDUnet', 'DeepFD', 'DeepFDDCN']:
+            # Deep FDConv U-Net: FDConv only at deepest level (L3+)
+            # More conservative - only L3 and bottleneck use FDConv
+            from models.rec_models.models.dcn_fd_unet import HybridFDUnet
+            self.reconstruction_model = HybridFDUnet(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                use_dcn=use_dcn,
+                fd_kernel_num=fd_kernel_num,
+                fd_start_level=3  # Levels 0,1,2: StandardConv | Level 3+bottleneck: FDConv
+            )
+        elif type in ['LightOD', 'LightODUnet', 'LightODDCN']:
+            # ODConv at bottleneck: Omni-dimensional dynamic convolution
+            # Provides channel, filter, and spatial attention with single kernel
+            from models.rec_models.models.dcn_fd_unet import LightODUnet
+            self.reconstruction_model = LightODUnet(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                use_dcn=use_dcn,
+                od_kernel_num=1  # Single kernel for efficiency
+            )
+        elif type in ['RigLUnet', 'RigL'] or (type.startswith('RigL') and type[4:].isdigit()):
+            # RigL U-Net: Dynamic sparse training
+            # Supports RigL, RigLUnet, and RigL{N} (e.g., RigL10, RigL50, RigL80)
+            # Use with --use-rigl flag to enable RigL sparse training
+            from models.rec_models.models.rigl_unet import RigLUnet
+            self.reconstruction_model = RigLUnet(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob
+            )
+        elif type in ['RigLLight', 'RigLLightUnet']:
+            # Lighter RigL U-Net for faster experimentation
+            from models.rec_models.models.rigl_unet import RigLLightUnet
+            self.reconstruction_model = RigLLightUnet(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob
+            )
+        elif type in ['UnetSkipLess', 'SkipLess', 'NoSkip']:
+            # UNet without skip connections - pure encoder-decoder
+            from models.rec_models.models.unet_skipless import UnetSkipLess
+            self.reconstruction_model = UnetSkipLess(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob
+            )
+        elif type in ['RigLSkipLess', 'RigLNoSkip'] or (type.startswith('RigLSkipLess') and type[11:].isdigit()):
+            # RigL with UNet without skip connections
+            # Supports RigLSkipLess, RigLSkipLess10, RigLSkipLess50, etc.
+            from models.rec_models.models.unet_skipless import RigLSkipLess
+            self.reconstruction_model = RigLSkipLess(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob
+            )
+        elif type in ['STAMPUnet', 'STAMP'] or type.startswith('STAMP'):
+            # STAMP U-Net: Simultaneous Training and Model Pruning
+            # Official implementation: https://github.com/nkdinsdale/STAMP.git
+            from models.rec_models.models.stamp_unet import STAMPUnet
+            # Extract b_drop from model name if specified (e.g., STAMP20 = 0.2 b_drop)
+            b_drop = 0.1  # Paper default
+            mode = 'Taylor'  # Paper default: Taylor expansion
+            if type.startswith('STAMP') and len(type) > 5 and type[5:].isdigit():
+                b_drop = int(type[5:]) / 100.0
+            # Support for different modes: STAMP_L1, STAMP_L2, STAMP_Random
+            if '_L1' in type:
+                mode = 'L1'
+            elif '_L2' in type:
+                mode = 'L2'
+            elif '_Random' in type:
+                mode = 'Random'
+            self.reconstruction_model = STAMPUnet(
+                in_chans=in_chans, out_chans=out_chans, chans=chans,
+                num_pool_layers=num_pool_layers, drop_prob=drop_prob,
+                b_drop=b_drop, mode=mode
+            )
+        elif type in ['StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim'] or type.startswith('RigLStaticSparse'):
+            # Static Sparse UNet - inspired by RigL learned sparsity patterns
+            # Channel reduction concentrated at bottleneck (where RigL learns most sparsity)
+            # RigLStaticSparse* variants add dynamic weight sparsity on top of architecture sparsity
+            sparsity_map = {
+                'StaticSparseLight': 'light',            # ~67% param reduction
+                'StaticSparseMedium': 'medium',          # ~83% param reduction
+                'StaticSparseHeavy': 'heavy',            # ~90% param reduction
+                'StaticSparse': 'medium',                # default to medium
+                'StaticSparse48Wide': 'wide_slim',       # 48 base, slim bottleneck (~2.04M)
+                'StaticSparseUltraLight': 'ultralight',  # 32 base, extreme bottleneck (~0.5M very light)
+                'StaticSparseFlat32': 'flat32',          # uniform 32 channels everywhere (~300K)
+                'StaticSparse64Extreme': 'wide64_extreme',  # 64 base, extreme compression (~1.24M)
+                # NEW: Asymmetric architectures learned from RigL
+                'StaticSparseAsymmetric': 'asymmetric_rigl',  # RigL-learned: slim encoder, fuller decoder
+                'StaticSparseAsymmetricSlim': 'asymmetric_slim',  # Ultra-slim asymmetric (~400K)
+            }
+            # Handle RigLStaticSparse* variants - map to base architecture
+            if type.startswith('RigLStaticSparse48Wide'):
+                sparsity_level = 'wide_slim'  # StaticSparse48Wide architecture
+            elif type.startswith('RigLStaticSparse64Extreme'):
+                sparsity_level = 'wide64_extreme'  # StaticSparse64Extreme architecture
+            else:
+                sparsity_level = sparsity_map.get(type, 'medium')
+            self.reconstruction_model = StaticSparseUNet(
+                in_chans=in_chans, out_chans=out_chans,
+                base_chans=chans, sparsity_level=sparsity_level,
+                drop_prob=drop_prob
+            )
+        elif type in ['LightUNet', 'LightDCN', 'LightFD', 'LightDCNFD', 'LightDCNUnet', 'LightFDUnet']:
+            # ConfigurableUNet: All variants in one model
+            # use_dcn and use_fdconv are passed from exp.py/train.py
+            self.reconstruction_model = ConfigurableUNet(
+                in_chans, out_chans, chans, num_pool_layers, drop_prob,
+                use_dcn=use_dcn,
+                use_fdconv=use_fdconv,
+                fd_kernel_num=fd_kernel_num
+            )
         elif type == 'humus':
             HUMUSReconstructionNet = HUMUSBlock(img_size=img_size, in_chans =in_chans, out_chans = out_chans, num_blocks = num_blocks, window_size = window_size, embed_dim = embed_dim)
             self.reconstruction_model = HUMUSReconstructionNet
@@ -486,7 +611,7 @@ class Subsampling_Model(nn.Module):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
-        elif self.type in ['Unet', 'DynamicUnet', 'CondUnet', 'HybridCondUnet', 'SmallCondUnet', 'FDUnet', 'HybridSnakeFDUnet', 'SmallHybridSnakeFDUnet', 'DCNFDUnet', 'SmallDCNFDUnet']:
+        elif self.type in ['Unet', 'DynamicUnet', 'CondUnet', 'HybridCondUnet', 'SmallCondUnet', 'FDUnet', 'HybridSnakeFDUnet', 'SmallHybridSnakeFDUnet', 'DCNFDUnet', 'SmallDCNFDUnet', 'LightUNet', 'LightDCN', 'LightFD', 'LightDCNFD', 'LightDCNUnet', 'LightFDUnet', 'FullFDUnet', 'FullFD', 'LightFullFD', 'FullFDDCN', 'HybridFDUnet', 'HybridFD', 'HybridFDDCN', 'DeepFDUnet', 'DeepFD', 'DeepFDDCN', 'LightOD', 'LightODUnet', 'LightODDCN', 'RigLUnet', 'RigL', 'RigLLight', 'RigLLightUnet', 'StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim', 'UnetSkipLess', 'SkipLess', 'NoSkip', 'RigLSkipLess', 'RigLNoSkip', 'STAMPUnet', 'STAMP'] or (self.type.startswith('RigL') and self.type[4:].isdigit()) or (self.type.startswith('UnetMasked') and self.type[10:].isdigit()) or (self.type.startswith('UnetMaskedDecoder') and self.type[17:].isdigit()) or (self.type.startswith('RigLSkipLess') and self.type[11:].isdigit()) or self.type.startswith('STAMP') or self.type.startswith('RigLStaticSparse'):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output

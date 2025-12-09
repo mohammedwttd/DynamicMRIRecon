@@ -12,17 +12,22 @@ import fastmri
 import numpy as np
 # np.seterr('raise')
 import torch
+
+# Disable cuFFT plan caching to prevent OOM/internal errors
+torch.backends.cuda.cufft_plan_cache[0].max_size = 0
 import torchvision
 from tensorboardX import SummaryWriter
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from torchvision import datasets, transforms as tv_transforms
+from PIL import Image
 from common.args import Args
 from data import transforms
 from data.mri_data import SliceData
 import matplotlib
 
-from models.rec_models.recon_net import ReconNet
-from models.rec_models.vit_model import VisionTransformer
+from models.rec_models.models.recon_net import ReconNet
+from models.rec_models.models.vit_model import VisionTransformer
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -43,6 +48,381 @@ import torch.nn as nn
 import torch.optim as optim
 import logging
 import torchvision.models as models
+
+
+class DecoderOnlyMaskTrainer:
+    """
+    Decoder-only inverse mask training: 
+    - Only DECODER's pruned (zero) weights are TRAINABLE
+    - Encoder and bottleneck pruned weights stay FROZEN at 0
+    - All active (non-zero) weights from RigL are FROZEN
+    """
+    def __init__(self, model, masks, device='cuda', reinit='xavier'):
+        self.model = model
+        self.masks = {}
+        self.inverse_masks = {}  # Only decoder layers
+        self.device = device
+        self.frozen_weights = {}
+        self.reinit = reinit
+        
+        encoder_trainable = 0
+        decoder_trainable = 0
+        bottleneck_trainable = 0
+        total_active = 0
+        
+        # Store masks and compute inverse only for decoder layers
+        for name, mask in masks.items():
+            self.masks[name] = mask.to(device)
+            layer_type = self._classify_layer(name)
+            
+            # Count statistics
+            active = (mask == 1).sum().item()
+            pruned = (mask == 0).sum().item()
+            total_active += active
+            
+            if layer_type == 'decoder':
+                # Decoder: pruned weights are trainable
+                self.inverse_masks[name] = (1 - mask).to(device)
+                decoder_trainable += pruned
+            else:
+                # Encoder/bottleneck: all weights frozen (including pruned ones)
+                self.inverse_masks[name] = torch.zeros_like(mask).to(device)
+                if layer_type == 'encoder':
+                    encoder_trainable += 0  # Not trainable
+                else:
+                    bottleneck_trainable += 0  # Not trainable
+        
+        # Save the frozen (active) weights before any training
+        self._save_frozen_weights()
+        
+        # Xavier reinitialize only decoder's pruned weights
+        if reinit == 'xavier':
+            self._xavier_reinit_pruned_weights()
+        
+        total_params = sum(m.numel() for m in self.masks.values())
+        print(f"\n{'='*70}")
+        print(f"Decoder-Only Mask Training: Only train DECODER's pruned weights")
+        print(f"{'='*70}")
+        print(f"  FROZEN (all active weights): {total_active:,}")
+        print(f"  FROZEN (encoder/bottleneck pruned): kept at 0")
+        print(f"  TRAINABLE (decoder pruned): {decoder_trainable:,}")
+        print(f"  Reinit method: {reinit}")
+        print(f"{'='*70}\n")
+    
+    def _classify_layer(self, name):
+        """Classify layer as encoder, decoder, or bottleneck."""
+        name_lower = name.lower()
+        if 'down' in name_lower or 'encoder' in name_lower:
+            return 'encoder'
+        elif 'up' in name_lower or 'decoder' in name_lower:
+            return 'decoder'
+        else:
+            return 'bottleneck'
+    
+    def _save_frozen_weights(self):
+        """Save a copy of the frozen (active) weights."""
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.masks:
+                    # Save only the active weights (masked by original mask)
+                    self.frozen_weights[mask_key] = (param.data * self.masks[mask_key]).clone()
+    
+    def _xavier_reinit_pruned_weights(self):
+        """Xavier reinitialize only decoder's pruned (trainable) weights."""
+        reinit_count = 0
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.inverse_masks and name.endswith('.weight'):
+                    inverse_mask = self.inverse_masks[mask_key]
+                    
+                    # Only reinit if there are trainable positions (decoder only)
+                    if inverse_mask.sum() > 0:
+                        if len(param.shape) >= 2:
+                            xavier_init = torch.empty_like(param.data)
+                            torch.nn.init.xavier_uniform_(xavier_init)
+                        else:
+                            xavier_init = torch.randn_like(param.data) * 0.01
+                        
+                        # Apply only to decoder's pruned positions
+                        param.data.copy_(
+                            self.frozen_weights[mask_key] +  # Frozen (active) weights
+                            xavier_init * inverse_mask       # Xavier init for decoder pruned
+                        )
+                        reinit_count += 1
+        
+        print(f"  [Xavier Reinit] Reinitialized decoder pruned weights in {reinit_count} layers")
+    
+    def zero_frozen_gradients(self):
+        """Zero out gradients for all frozen weights - only train decoder pruned."""
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.inverse_masks:
+                    # Only allow gradients where inverse_mask = 1 (decoder pruned only)
+                    param.grad.mul_(self.inverse_masks[mask_key])
+    
+    def step(self):
+        """After optimizer step, restore frozen weights."""
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.frozen_weights:
+                    # Combine: frozen_weights (active) + new_weights (decoder pruned only)
+                    param.data.copy_(
+                        self.frozen_weights[mask_key] + 
+                        param.data * self.inverse_masks[mask_key]
+                    )
+    
+    def print_sparsity(self):
+        """Print current model statistics."""
+        total = 0
+        zeros = 0
+        for name, param in self.model.named_parameters():
+            if 'reconstruction_model' in name and 'weight' in name:
+                total += param.numel()
+                zeros += (param == 0).sum().item()
+        print(f"  [DecoderOnlyMask] Zeros: {zeros:,}/{total:,} ({100*zeros/total:.1f}%)")
+
+
+class FrozenMaskTrainer:
+    """
+    Inverse mask training: Train the PRUNED weights, freeze the ACTIVE weights.
+    - RigL's learned (non-zero) weights are FROZEN
+    - RigL's pruned (zero) weights are TRAINABLE (Xavier reinitialized)
+    """
+    def __init__(self, model, masks, device='cuda', reinit='xavier'):
+        self.model = model
+        self.masks = {}
+        self.inverse_masks = {}
+        self.device = device
+        self.frozen_weights = {}
+        self.reinit = reinit
+        
+        # Store masks and compute inverse
+        for name, mask in masks.items():
+            self.masks[name] = mask.to(device)
+            self.inverse_masks[name] = (1 - mask).to(device)
+        
+        # Save the frozen (active) weights before any training
+        self._save_frozen_weights()
+        
+        # Xavier reinitialize the trainable (pruned) weights
+        if reinit == 'xavier':
+            self._xavier_reinit_pruned_weights()
+        
+        # Count trainable vs frozen
+        total_params = 0
+        frozen_params = 0
+        trainable_params = 0
+        
+        for name, mask in self.masks.items():
+            total_params += mask.numel()
+            frozen_params += (mask == 1).sum().item()
+            trainable_params += (mask == 0).sum().item()
+        
+        print(f"\n{'='*70}")
+        print(f"Inverse Mask Training: Train PRUNED weights, Freeze ACTIVE weights")
+        print(f"{'='*70}")
+        print(f"  FROZEN (RigL learned): {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+        print(f"  TRAINABLE (RigL pruned): {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        print(f"  Reinit method: {reinit}")
+        print(f"{'='*70}\n")
+    
+    def _save_frozen_weights(self):
+        """Save a copy of the frozen (active) weights."""
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.masks:
+                    # Save only the active weights (masked by original mask)
+                    self.frozen_weights[mask_key] = (param.data * self.masks[mask_key]).clone()
+    
+    def _xavier_reinit_pruned_weights(self):
+        """Xavier reinitialize the pruned (trainable) weights."""
+        reinit_count = 0
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.inverse_masks and name.endswith('.weight'):
+                    inverse_mask = self.inverse_masks[mask_key]
+                    
+                    # Only reinit if there are pruned positions
+                    if inverse_mask.sum() > 0:
+                        # Create Xavier initialized tensor
+                        if len(param.shape) >= 2:
+                            # For conv/linear weights: use xavier_uniform
+                            xavier_init = torch.empty_like(param.data)
+                            torch.nn.init.xavier_uniform_(xavier_init)
+                        else:
+                            # For 1D params (rare): use normal init
+                            xavier_init = torch.randn_like(param.data) * 0.01
+                        
+                        # Apply only to pruned positions (inverse_mask = 1)
+                        # Keep frozen weights unchanged (mask = 1)
+                        param.data.copy_(
+                            self.frozen_weights[mask_key] +  # Frozen (active) weights
+                            xavier_init * inverse_mask       # Xavier init for pruned weights
+                        )
+                        reinit_count += 1
+        
+        print(f"  [Xavier Reinit] Reinitialized pruned weights in {reinit_count} layers")
+    
+    def zero_frozen_gradients(self):
+        """Zero out gradients for frozen (active) weights - only train pruned weights."""
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.inverse_masks:
+                    # Only allow gradients where inverse_mask = 1 (pruned positions)
+                    param.grad.mul_(self.inverse_masks[mask_key])
+    
+    def step(self):
+        """After optimizer step, restore frozen weights."""
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                if mask_key in self.frozen_weights:
+                    # Combine: frozen_weights (active) + new_weights (pruned)
+                    param.data.copy_(
+                        self.frozen_weights[mask_key] + 
+                        param.data * self.inverse_masks[mask_key]
+                    )
+    
+    def print_sparsity(self):
+        """Print current model statistics."""
+        total = 0
+        zeros = 0
+        for name, param in self.model.named_parameters():
+            if 'reconstruction_model' in name and 'weight' in name:
+                total += param.numel()
+                zeros += (param == 0).sum().item()
+        print(f"  [InverseMask] Zeros: {zeros:,}/{total:,} ({100*zeros/total:.1f}%)")
+    
+    def single_shot_adapt(self, input_data, target, criterion, num_steps=20, lr=1e-4):
+        """
+        Single-shot learning: Adapt model on a single example with multiple gradient steps.
+        Only trains the pruned weights (frozen weights stay fixed).
+        Saves and restores best weights (lowest loss) during adaptation.
+        
+        Args:
+            input_data: Single input tensor (B, C, H, W) or (B, C, H, W, 2)
+            target: Target tensor
+            criterion: Loss function
+            num_steps: Number of gradient steps (default: 20)
+            lr: Learning rate for adaptation (default: 1e-4)
+        
+        Returns:
+            losses: List of losses during adaptation
+            final_output: Model output after adaptation
+        """
+        import torch.optim as optim
+        
+        # Create optimizer for all params (we'll mask gradients manually)
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        
+        self.model.train()
+        losses = []
+        
+        # Track best weights
+        best_loss = float('inf')
+        best_weights = None
+        best_step = 0
+        
+        print(f"  [SingleShot] Adapting on single example with {num_steps} steps (lr={lr})...")
+        
+        for step in range(num_steps):
+            optimizer.zero_grad()
+            
+            # Forward pass
+            output = self.model(input_data)
+            loss = criterion(output, target)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Zero gradients for frozen weights (only train pruned weights)
+            self.zero_frozen_gradients()
+            
+            # Update weights
+            optimizer.step()
+            
+            # Restore frozen weights
+            self.step()
+            
+            current_loss = loss.item()
+            losses.append(current_loss)
+            
+            # Save best weights
+            if current_loss < best_loss:
+                best_loss = current_loss
+                best_step = step + 1
+                # Save only the pruned weights (the ones we're training)
+                best_weights = {}
+                with torch.no_grad():
+                    for name, param in self.model.named_parameters():
+                        mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                        if mask_key in self.inverse_masks:
+                            # Save the pruned portion of weights
+                            best_weights[name] = (param.data * self.inverse_masks[mask_key]).clone()
+            
+            if (step + 1) % 5 == 0:
+                print(f"    Step {step+1}/{num_steps}: Loss = {current_loss:.6f} (best: {best_loss:.6f} @ step {best_step})")
+        
+        # Restore best weights
+        if best_weights is not None:
+            print(f"  [SingleShot] Restoring best weights from step {best_step} (loss: {best_loss:.6f})")
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    if name in best_weights:
+                        mask_key = name.replace('.weight', '') if name.endswith('.weight') else name
+                        if mask_key in self.frozen_weights:
+                            # Combine: frozen weights + best pruned weights
+                            param.data.copy_(self.frozen_weights[mask_key] + best_weights[name])
+        
+        # Get final output
+        self.model.eval()
+        with torch.no_grad():
+            final_output = self.model(input_data)
+        
+        print(f"  [SingleShot] Done. Initial: {losses[0]:.6f}, Best: {best_loss:.6f} (step {best_step}), Final: {losses[-1]:.6f}")
+        
+        return losses, final_output
+
+
+def load_rigl_checkpoint(checkpoint_path, model, device='cuda'):
+    """Load RigL model weights and masks from a checkpoint file."""
+    print(f"\n{'='*70}")
+    print(f"Loading RigL checkpoint: {checkpoint_path}")
+    print(f"{'='*70}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load model weights
+    if 'model' in checkpoint:
+        model.load_state_dict(checkpoint['model'])
+        print(f"  Loaded model weights")
+    else:
+        raise ValueError(f"Checkpoint does not contain model weights: {checkpoint_path}")
+    
+    # Load masks
+    if 'rigl_scheduler' not in checkpoint or 'masks' not in checkpoint['rigl_scheduler']:
+        raise ValueError(f"Checkpoint does not contain RigL masks: {checkpoint_path}")
+    
+    masks = checkpoint['rigl_scheduler']['masks']
+    print(f"  Loaded {len(masks)} masks")
+    
+    # Print checkpoint info
+    if 'epoch' in checkpoint:
+        print(f"  Checkpoint epoch: {checkpoint['epoch']}")
+    if 'best_psnr_mean' in checkpoint:
+        print(f"  Best PSNR: {checkpoint['best_psnr_mean']:.2f}")
+    
+    print(f"{'='*70}\n")
+    
+    return masks
+
 
 def normalize(img):
     return (img - img.min()) / (img.max() - img.min() + 1e-8)
@@ -95,20 +475,102 @@ class DataTransform:
         return fastmri.rss(image), target, mean, std, attrs['norm'].astype(np.float32)
 
 
+class ImageNetTransform:
+    """
+    Transform for ImageNet data to be compatible with MRI reconstruction model.
+    Converts RGB images to grayscale with pseudo-complex format (H, W, 2).
+    """
+    def __init__(self, resolution=320):
+        self.resolution = resolution
+        self.transform = tv_transforms.Compose([
+            tv_transforms.Resize((resolution, resolution)),
+            tv_transforms.Grayscale(num_output_channels=1),
+            tv_transforms.ToTensor(),  # Converts to (1, H, W) in [0, 1]
+        ])
+    
+    def __call__(self, img):
+        # Apply transforms
+        img_tensor = self.transform(img)  # (1, H, W)
+        
+        # Convert to pseudo-complex format (H, W, 2) for model compatibility
+        # Real part = image, Imaginary part = zeros
+        img_gray = img_tensor.squeeze(0)  # (H, W)
+        img_complex = torch.stack([img_gray, torch.zeros_like(img_gray)], dim=-1)  # (H, W, 2)
+        
+        # Target should be (H, W) to match model output shape after batching
+        # MRI target is (H, W), model outputs (B, H, W), so ImageNet target must be (H, W) too
+        target = normalize(img_gray)  # (H, W) - squeezed to match MRI format
+        
+        mean = std = 0
+        norm = np.float32(1.0)
+        
+        return img_complex, target, mean, std, norm
+
+
+class ImageNetDataset(torch.utils.data.Dataset):
+    """
+    ImageNet dataset wrapper that returns data in MRI reconstruction format.
+    """
+    def __init__(self, root, split='train', resolution=320):
+        self.resolution = resolution
+        self.transform = ImageNetTransform(resolution)
+        
+        # Use torchvision ImageFolder
+        self.dataset = datasets.ImageFolder(root=root)
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        img, label = self.dataset[idx]
+        return self.transform(img)
+
+
 def create_datasets(args):
-    print(args.data_path / f'multicoil_train', flush=True)
-    print(args.data_path / f'multicoil_val', flush=True)
-    train_data = SliceData(
-        root=args.data_path / f'multicoil_train',
-        transform=DataTransform(args.resolution),
-        sample_rate=args.sample_rate)
+    dataset_type = getattr(args, 'dataset', 'mri')
+    
+    if dataset_type == 'imagenet':
+        # ImageNet dataset
+        imagenet_path = getattr(args, 'imagenet_path', pathlib.Path('../ImageNet'))
+        print(f"Using ImageNet dataset from: {imagenet_path}", flush=True)
+        print(f"  Train: {imagenet_path / 'train'}", flush=True)
+        print(f"  Val: {imagenet_path / 'val'}", flush=True)
+        
+        train_data = ImageNetDataset(
+            root=str(imagenet_path / 'train'),
+            split='train',
+            resolution=args.resolution
+        )
+        
+        dev_data = ImageNetDataset(
+            root=str(imagenet_path / 'val'),
+            split='val',
+            resolution=args.resolution
+        )
+        
+        # Apply sample rate if specified
+        if args.sample_rate < 1.0:
+            num_train = int(len(train_data) * args.sample_rate)
+            indices = list(range(num_train))
+            train_data = torch.utils.data.Subset(train_data, indices)
+        
+        return dev_data, train_data
+    
+    else:
+        # MRI dataset (default)
+        print(args.data_path / f'multicoil_train', flush=True)
+        print(args.data_path / f'multicoil_val', flush=True)
+        train_data = SliceData(
+            root=args.data_path / f'multicoil_train',
+            transform=DataTransform(args.resolution),
+            sample_rate=args.sample_rate)
 
-    dev_data = SliceData(
-        root=args.data_path / f'multicoil_val',
-        transform=DataTransform(args.resolution),
-        sample_rate=1)
+        dev_data = SliceData(
+            root=args.data_path / f'multicoil_val',
+            transform=DataTransform(args.resolution),
+            sample_rate=1)
 
-    return dev_data, train_data
+        return dev_data, train_data
 
 
 def create_data_loaders(args):
@@ -331,7 +793,7 @@ def select_top_perturbations_balanced(model, image, target, mask_module, loss_fn
     return final_mask.view_as(perturbation_mask)
 
 
-def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask = None):
+def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask = None, rigl_scheduler = None, frozen_mask_trainer = None):
     model.train()
     avg_loss = 0.
 
@@ -373,6 +835,21 @@ def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, write
         torch.cuda.empty_cache()
         optimizer.zero_grad()
         optimizer_sub.zero_grad()
+        
+        # RigL: Apply masks to zero out inactive weights before forward pass
+        if rigl_scheduler is not None:
+            rigl_scheduler.apply_masks()
+            # Print sparsity every 100 iterations (matching RigL update frequency)
+            if iter % 100 == 0:
+                total_params = 0
+                zero_params = 0
+                for param in model.module.reconstruction_model.parameters():
+                    total_params += param.numel()
+                    zero_params += (param.data == 0).sum().item()
+                print(f"  [RigL] Model sparsity: {zero_params:,}/{total_params:,} zeros ({100*zero_params/total_params:.1f}% sparse)")
+        
+        # Frozen mask training: no action needed before forward pass
+        # (frozen weights are preserved, trainable weights can be any value)
             
         input, target, mean, std, norm = data
         if input is None:
@@ -448,9 +925,25 @@ def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, write
         #print("before backprop:", model.module.subsampling.x)
         loss.backward()
         #print("after backprop:", model.module.subsampling.x)
+        
+        # RigL: update sparse masks based on gradients
+        if rigl_scheduler is not None:
+            rigl_scheduler.step()
+        
+        # Frozen mask training: zero out gradients for frozen (active) weights
+        if frozen_mask_trainer is not None:
+            frozen_mask_trainer.zero_frozen_gradients()
+        
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=1.)
         optimizer.step()
         optimizer_sub.step()
+        
+        # Frozen mask training: re-apply masks after optimizer step to ensure zeros stay zero
+        if frozen_mask_trainer is not None:
+            frozen_mask_trainer.step()
+            if iter % 500 == 0:
+                frozen_mask_trainer.print_sparsity()
+        
         if args.initialization == 'cartesian':
             model.module.subsampling.apply_binary_grad(optimizer_sub.param_groups[0]['lr'])
         model.module.subsampling.attack_trajectory = None
@@ -624,22 +1117,32 @@ def visualize(args, epoch, model, data_loader, writer):
             break
 
 
-def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best, metrics):
-    torch.save(
-        {
-            'epoch': epoch,
-            'args': args,
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'best_dev_loss': best_dev_loss,
-            'best_psnr_mean': best_psnr_mean,
-            'best_ssim_mean': best_ssim_mean,
-            'exp_dir': exp_dir,
-            'metrics': metrics
-        },
-        f=exp_dir + '/model.pt'
-    )
+def save_model(args, exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best, metrics, rigl_scheduler=None):
+    checkpoint = {
+        'epoch': epoch,
+        'args': args,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'best_dev_loss': best_dev_loss,
+        'best_psnr_mean': best_psnr_mean,
+        'best_ssim_mean': best_ssim_mean,
+        'exp_dir': exp_dir,
+        'metrics': metrics
+    }
+    
+    # Save RigL scheduler state (masks) if present
+    if rigl_scheduler is not None:
+        checkpoint['rigl_scheduler'] = rigl_scheduler.state_dict()
+        # Log sparsity info
+        total_masked = 0
+        total_params = 0
+        for name, mask in rigl_scheduler.masks.items():
+            total_masked += (mask == 0).sum().item()
+            total_params += mask.numel()
+        print(f"  [RigL] Saving model with masks: {total_masked:,}/{total_params:,} masked ({100*total_masked/total_params:.1f}% sparse)")
+    
+    torch.save(checkpoint, f=exp_dir + '/model.pt')
     if is_new_best:
         shutil.copyfile(exp_dir + '/model.pt', exp_dir + '/best_model.pt')
 
@@ -755,6 +1258,9 @@ def build_model(args):
         # HybridSnakeFDUnet parameters
         snake_layers=args.snake_layers if hasattr(args, 'snake_layers') else 2,
         snake_kernel_size=args.snake_kernel_size if hasattr(args, 'snake_kernel_size') else 9,
+        # ConfigurableUNet parameters (LightUNet, LightDCN, LightFD, LightDCNFD)
+        use_dcn=args.use_dcn if hasattr(args, 'use_dcn') else False,
+        use_fdconv=args.use_fdconv if hasattr(args, 'use_fdconv') else False,
     ).to(args.device)
     
     # Count and display parameters
@@ -806,26 +1312,43 @@ def build_optim(args, model):
     return optimizer, optimizer_sub
 
 def build_scheduler(optimizer, optimizer_sub, args):
-    scheduler_sub = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer_sub,
-        max_lr=[args.sub_lr],  # One per param group
-        total_steps=(args.num_epochs) if "vit-l-pretrained-radial" in args.model else args.num_epochs,    # = 40
-        pct_start= 0.1,  # = 0.1 for 4 warmup epochs
-        anneal_strategy='linear',       # linear decay after warmup
-        cycle_momentum=False,           # disable momentum scheduling
-        div_factor=10,                 # base_lr = max_lr / div_factor (i.e., start at 0)
-        final_div_factor=1e9            # decay linearly to ~0
-    )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[args.lr],  # One per param group
-        total_steps=args.num_epochs,    # = 40
-        pct_start= 0.1,  # = 0.1 for 4 warmup epochs
-        anneal_strategy='linear',       # linear decay after warmup
-        cycle_momentum=False,           # disable momentum scheduling
-        div_factor=10,                 # base_lr = max_lr / div_factor (i.e., start at 0)
-        final_div_factor=1e9            # decay linearly to ~0
-    )
+    # For small number of epochs (e.g., ImageNet experiments), use StepLR to avoid OneCycleLR issues
+    # OneCycleLR requires total_steps > pct_start * total_steps for warmup phase
+    if args.num_epochs < 20:
+        # Use StepLR for short training runs
+        scheduler_sub = torch.optim.lr_scheduler.StepLR(
+            optimizer_sub,
+            step_size=max(1, args.num_epochs // 3),
+            gamma=0.1
+        )
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=max(1, args.num_epochs // 3),
+            gamma=0.1
+        )
+    else:
+        # Use OneCycleLR for longer training runs
+        total_steps = args.num_epochs
+        scheduler_sub = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer_sub,
+            max_lr=[args.sub_lr],  # One per param group
+            total_steps=(total_steps) if "vit-l-pretrained-radial" in args.model else total_steps,
+            pct_start=0.1,  # = 0.1 for warmup
+            anneal_strategy='linear',       # linear decay after warmup
+            cycle_momentum=False,           # disable momentum scheduling
+            div_factor=10,                 # base_lr = max_lr / div_factor (i.e., start at 0)
+            final_div_factor=1e9            # decay linearly to ~0
+        )
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[args.lr],  # One per param group
+            total_steps=total_steps,
+            pct_start=0.1,  # = 0.1 for warmup
+            anneal_strategy='linear',       # linear decay after warmup
+            cycle_momentum=False,           # disable momentum scheduling
+            div_factor=10,                 # base_lr = max_lr / div_factor (i.e., start at 0)
+            final_div_factor=1e9            # decay linearly to ~0
+        )
     return scheduler, scheduler_sub
 
 
@@ -881,6 +1404,7 @@ def train():
     d_scheduler = None
     g_scheduler = None
 
+    rigl_state = None  # Will be loaded from checkpoint if resuming with RigL
     if args.resume:
         checkpoint, model, optimizer = load_model(args.checkpoint)
         # args = checkpoint['args']
@@ -888,6 +1412,7 @@ def train():
         best_psnr_mean = checkpoint['best_psnr_mean']
         best_ssim_mean = checkpoint['best_ssim_mean']
         start_epoch = checkpoint['epoch'] + 1
+        rigl_state = checkpoint.get('rigl_scheduler', None)  # Save for later
         del checkpoint
     else:
         model = build_model(args)
@@ -904,7 +1429,6 @@ def train():
         optimizer, optimizer_sub = build_optim(args, model)
         scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
 
-
         best_dev_loss = 1e9
         best_psnr_mean = 0
         best_ssim_mean = 0
@@ -916,6 +1440,74 @@ def train():
     if "cartesian" and "pgd" in args.noise_behaviour:
         adv_mask = SubsamplingBinary(320, 100, 0, adv=True).to("cuda")
     train_loader, dev_loader, display_loader = create_data_loaders(args)
+    
+    # RigL sparse training scheduler (created after data loaders to know total iterations)
+    rigl_scheduler = None
+    if args.use_rigl:
+        from models.rec_models.layers.rigl_sparse import RigLScheduler
+        iters_per_epoch = len(train_loader)
+        total_iters = args.num_epochs * iters_per_epoch
+        # Update masks twice per epoch (restructure at mid-epoch and end-of-epoch)
+        rigl_update_freq = iters_per_epoch // 2
+        rigl_scheduler = RigLScheduler(
+            model=model,
+            sparsity=args.rigl_sparsity,
+            update_freq=rigl_update_freq,
+            T_end=int(total_iters * 0.75),  # Stop mask updates at 75% of training
+            delta=args.rigl_delta,
+            exclude_layers=['first', 'final', 'conv.0'],  # Exclude first/last layers
+        )
+        print(f"\n*** RigL Enabled: {args.rigl_sparsity*100:.0f}% sparsity, update every {rigl_update_freq} iters (2x per epoch) ***")
+        print(f"*** Iters per epoch: {iters_per_epoch}, Total iterations: {total_iters}, T_end: {int(total_iters * 0.75)} ***\n")
+        
+        # Restore RigL state when resuming
+        if args.resume:
+            if rigl_state is not None:
+                # Full restore from saved state
+                rigl_scheduler.load_state_dict(rigl_state)
+                print(f"*** RigL: Restored from checkpoint (iter {rigl_scheduler.iteration}) ***\n")
+            else:
+                # Reconstruct masks from weights (backward compatible)
+                start_iter = start_epoch * len(train_loader)
+                rigl_scheduler.reconstruct_from_weights(start_iter)
+                print(f"*** RigL: Reconstructed masks from weights (iter {start_iter}) ***\n")
+    
+    # Frozen mask training (train pruned weights, freeze learned weights)
+    frozen_mask_trainer = None
+    if args.freeze_masked or getattr(args, 'freeze_masked_decoder_only', False):
+        if args.rigl_checkpoint is None:
+            raise ValueError("--freeze-masked or --freeze-masked-decoder-only requires --rigl-checkpoint")
+        
+        # Load both model weights AND masks from RigL checkpoint
+        masks = load_rigl_checkpoint(args.rigl_checkpoint, model, device='cuda')
+        
+        if getattr(args, 'freeze_masked_decoder_only', False):
+            # Decoder-only: only train decoder's pruned weights
+            frozen_mask_trainer = DecoderOnlyMaskTrainer(model, masks, device='cuda')
+        else:
+            # Full: train all pruned weights
+            frozen_mask_trainer = FrozenMaskTrainer(model, masks, device='cuda')
+    
+    # STAMP scheduler for channel-wise structured pruning
+    # Based on: https://github.com/nkdinsdale/STAMP.git
+    stamp_scheduler = None
+    if hasattr(args, 'use_stamp') and args.use_stamp:
+        from models.rec_models.models.stamp_unet import STAMPScheduler
+        prune_epochs = args.stamp_prune_epochs if args.stamp_prune_epochs else None  # None = auto
+        stamp_mode = getattr(args, 'stamp_mode', 'Taylor')  # Default to Taylor if not specified
+        stamp_scheduler = STAMPScheduler(
+            model=model.module.reconstruction_model,
+            b_drop=args.stamp_channel_drop_rate,
+            prune_epochs=prune_epochs,
+            prune_ratio=args.stamp_prune_ratio,
+            recovery_epochs=args.stamp_recovery_epochs,
+            total_epochs=args.num_epochs,
+            mode=stamp_mode
+        )
+        print(f"\n*** STAMP Enabled (https://github.com/nkdinsdale/STAMP.git) ***")
+        print(f"*** Mode: {stamp_mode} | b_drop: {args.stamp_channel_drop_rate*100:.0f}% | Keep ratio: {args.stamp_prune_ratio*100:.0f}% ***")
+        print(f"*** Recovery epochs: {args.stamp_recovery_epochs} | Total epochs: {args.num_epochs} ***\n")
+    
     dev_loss, dev_time = evaluate(args, 0, model, dev_loader, writer)
     print("started mid point", flush=True)
     best_epoch = 0
@@ -923,7 +1515,18 @@ def train():
     for epoch in range(start_epoch, args.num_epochs):
         if noise_behaviour == "log":
             model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
-        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask)
+        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask, rigl_scheduler, frozen_mask_trainer)
+        
+        # STAMP: Update dropout probabilities based on filter importance
+        if stamp_scheduler is not None:
+            # Pass data loader and L1 loss for computing filter importance
+            current_drop_rate = stamp_scheduler.step(
+                epoch, 
+                data_loader=train_loader, 
+                criterion=nn.L1Loss()
+            )
+            if epoch % 10 == 0:
+                print(f"  [STAMP] Epoch {epoch}: b_drop = {current_drop_rate*100:.1f}%")
         
         # Dynamic U-Net: channel swapping happens automatically during training batches
         # (see train_epoch function where maybe_swap_channels() is called)
@@ -937,7 +1540,7 @@ def train():
             best_epoch = epoch
         else:
             is_new_best = False
-        save_model(args, args.exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best, metrics)
+        save_model(args, args.exp_dir, epoch, model, optimizer, scheduler, best_dev_loss, best_psnr_mean, best_ssim_mean, is_new_best, metrics, rigl_scheduler)
         logging.info(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
             f'DevLoss = {dev_loss:.4g} TrainTime = {train_time:.4f}s DevTime = {dev_time:.4f}s',
@@ -1035,6 +1638,12 @@ def create_arg_parser():
     parser.add_argument('--snake-kernel-size', type=int, default=9,
                         help='Kernel size for Snake Convolution (for HybridSnakeFDUnet)')
     
+    # ConfigurableUNet parameters (LightUNet, LightDCN, LightFD, LightDCNFD)
+    parser.add_argument('--use-dcn', action='store_true', default=False,
+                        help='Use DCNv2 for skip connection alignment')
+    parser.add_argument('--use-fdconv', action='store_true', default=False,
+                        help='Use FDConv at bottleneck')
+    
     parser.add_argument('--inter-gap-mode', type=str, default='constant',
                         help='How the interpolated gap will change during the training')
     parser.add_argument('--img-size', type=int, nargs=2, default=[320, 320], help='Image size (height, width)')
@@ -1057,6 +1666,46 @@ def create_arg_parser():
     parser.add_argument('--std-image', type=float, default=0, help='The std of the normal noise on the image')
     parser.add_argument('--acceleration', type=int, default=4, help='The Cartesian Acceleration')
     parser.add_argument('--center-fraction', type=float, default=0.08, help='The Cartesian Center Fraction')
+    
+    # Dataset selection
+    parser.add_argument('--dataset', type=str, default='mri', choices=['mri', 'imagenet'],
+                        help='Dataset to use: mri (FastMRI) or imagenet')
+    parser.add_argument('--imagenet-path', type=pathlib.Path, default=pathlib.Path('../ImageNet'),
+                        help='Path to ImageNet dataset (only used if --dataset=imagenet)')
+    
+    # RigL sparse training arguments
+    parser.add_argument('--use-rigl', action='store_true', default=False,
+                        help='Enable RigL dynamic sparse training')
+    parser.add_argument('--rigl-sparsity', type=float, default=0.5,
+                        help='Target sparsity for RigL (0.5 = 50% zeros)')
+    parser.add_argument('--rigl-update-freq', type=int, default=100,
+                        help='How often to update sparse masks (in iterations)')
+    parser.add_argument('--rigl-delta', type=float, default=0.3,
+                        help='Fraction of weights to reallocate each update')
+    
+    # Frozen mask training (sparse fine-tuning)
+    parser.add_argument('--freeze-masked', action='store_true', default=False,
+                        help='Train only non-masked (active) weights, keep masked weights frozen at zero')
+    parser.add_argument('--freeze-masked-decoder-only', action='store_true', default=False,
+                        help='Train only DECODER pruned weights, encoder/bottleneck pruned stay at 0')
+    parser.add_argument('--rigl-checkpoint', type=str, default=None,
+                        help='Path to RigL checkpoint to load masks from (for --freeze-masked)')
+    
+    # STAMP channel-wise pruning arguments (paper Section 2.5.1 defaults)
+    # Based on: https://github.com/nkdinsdale/STAMP.git
+    parser.add_argument('--use-stamp', action='store_true', default=False,
+                        help='Enable STAMP simultaneous training and channel pruning')
+    parser.add_argument('--stamp-channel-drop-rate', type=float, default=0.1,
+                        help='b_drop: Channel dropout rate (paper default: 0.1)')
+    parser.add_argument('--stamp-prune-ratio', type=float, default=0.5,
+                        help='Fraction of channels to keep at each prune (0.5 = keep 50%)')
+    parser.add_argument('--stamp-recovery-epochs', type=int, default=5,
+                        help='Recovery epochs between prunings (paper default: 5)')
+    parser.add_argument('--stamp-prune-epochs', type=int, nargs='+', default=[],
+                        help='Specific epochs to prune (empty = auto-generate)')
+    parser.add_argument('--stamp-mode', type=str, default='Taylor',
+                        choices=['Taylor', 'L1', 'L2', 'Random'],
+                        help='Importance scoring mode: Taylor (gradient*activation, default), L1, L2, Random')
     return parser
 
 
