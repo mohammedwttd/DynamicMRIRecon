@@ -364,6 +364,10 @@ lr = {
     'StaticSparseFlat32': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     # StaticSparse64Extreme: 64 base, extreme compression (~1.5M params, heavier than heavy)
     'StaticSparse64Extreme': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
+    # StaticSparse64ExtremeSlim: 64 base with slimmer decoder
+    'StaticSparse64ExtremeSlim': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
+    # StaticSparse64DecoderHeavy: 64 base, slim encoder, fuller decoder (RigL-inspired)
+    'StaticSparse64DecoderHeavy': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     # ═══════════════════════════════════════════════════════════════════════════
     # ASYMMETRIC StaticSparse: RigL-learned pattern - slim encoder, fuller decoder
     # Based on RigL60 learning: Encoder 36% dense, Decoder 50% dense
@@ -934,6 +938,21 @@ elif model == 'StaticSparse64Extreme':
     # 64 base channels with EXTREME compression (~1.5M params)
     # Wide early layers (64, 128) but extremely compressed deep layers
     # Heavier compression than StaticSparseHeavy
+    num_chans = 64
+    use_dcn = False
+    use_fdconv = False
+
+elif model == 'StaticSparse64ExtremeSlim':
+    # 64 base channels with slimmer decoder
+    # Wide encoder (64, 128, 128, 96) but slim decoder (64, 64, 64, 64)
+    num_chans = 64
+    use_dcn = False
+    use_fdconv = False
+
+elif model == 'StaticSparse64DecoderHeavy':
+    # RigL-inspired: slim encoder, fuller decoder
+    # Encoder: 64 -> 64 -> 64 -> 48 (compressed)
+    # Decoder: 96 -> 128 -> 128 -> 64 (heavy capacity)
     num_chans = 64
     use_dcn = False
     use_fdconv = False

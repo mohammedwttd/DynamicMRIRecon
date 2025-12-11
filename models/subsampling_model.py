@@ -561,7 +561,7 @@ class Subsampling_Model(nn.Module):
                 num_pool_layers=num_pool_layers, drop_prob=drop_prob,
                 b_drop=b_drop, mode=mode
             )
-        elif type in ['StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim'] or type.startswith('RigLStaticSparse'):
+        elif type in ['StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparse64ExtremeSlim', 'StaticSparse64DecoderHeavy', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim'] or type.startswith('RigLStaticSparse'):
             # Static Sparse UNet - inspired by RigL learned sparsity patterns
             # Channel reduction concentrated at bottleneck (where RigL learns most sparsity)
             # RigLStaticSparse* variants add dynamic weight sparsity on top of architecture sparsity
@@ -574,6 +574,8 @@ class Subsampling_Model(nn.Module):
                 'StaticSparseUltraLight': 'ultralight',  # 32 base, extreme bottleneck (~0.5M very light)
                 'StaticSparseFlat32': 'flat32',          # uniform 32 channels everywhere (~300K)
                 'StaticSparse64Extreme': 'wide64_extreme',  # 64 base, extreme compression (~1.24M)
+                'StaticSparse64ExtremeSlim': 'wide64_extreme_slim',  # 64 base, slimmer decoder
+                'StaticSparse64DecoderHeavy': 'wide64_decoder_heavy',  # 64 base, slim encoder, fuller decoder
                 # NEW: Asymmetric architectures learned from RigL
                 'StaticSparseAsymmetric': 'asymmetric_rigl',  # RigL-learned: slim encoder, fuller decoder
                 'StaticSparseAsymmetricSlim': 'asymmetric_slim',  # Ultra-slim asymmetric (~400K)
@@ -611,7 +613,7 @@ class Subsampling_Model(nn.Module):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
-        elif self.type in ['Unet', 'DynamicUnet', 'CondUnet', 'HybridCondUnet', 'SmallCondUnet', 'FDUnet', 'HybridSnakeFDUnet', 'SmallHybridSnakeFDUnet', 'DCNFDUnet', 'SmallDCNFDUnet', 'LightUNet', 'LightDCN', 'LightFD', 'LightDCNFD', 'LightDCNUnet', 'LightFDUnet', 'FullFDUnet', 'FullFD', 'LightFullFD', 'FullFDDCN', 'HybridFDUnet', 'HybridFD', 'HybridFDDCN', 'DeepFDUnet', 'DeepFD', 'DeepFDDCN', 'LightOD', 'LightODUnet', 'LightODDCN', 'RigLUnet', 'RigL', 'RigLLight', 'RigLLightUnet', 'StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim', 'UnetSkipLess', 'SkipLess', 'NoSkip', 'RigLSkipLess', 'RigLNoSkip', 'STAMPUnet', 'STAMP'] or (self.type.startswith('RigL') and self.type[4:].isdigit()) or (self.type.startswith('UnetMasked') and self.type[10:].isdigit()) or (self.type.startswith('UnetMaskedDecoder') and self.type[17:].isdigit()) or (self.type.startswith('RigLSkipLess') and self.type[11:].isdigit()) or self.type.startswith('STAMP') or self.type.startswith('RigLStaticSparse'):
+        elif self.type in ['Unet', 'DynamicUnet', 'CondUnet', 'HybridCondUnet', 'SmallCondUnet', 'FDUnet', 'HybridSnakeFDUnet', 'SmallHybridSnakeFDUnet', 'DCNFDUnet', 'SmallDCNFDUnet', 'LightUNet', 'LightDCN', 'LightFD', 'LightDCNFD', 'LightDCNUnet', 'LightFDUnet', 'FullFDUnet', 'FullFD', 'LightFullFD', 'FullFDDCN', 'HybridFDUnet', 'HybridFD', 'HybridFDDCN', 'DeepFDUnet', 'DeepFD', 'DeepFDDCN', 'LightOD', 'LightODUnet', 'LightODDCN', 'RigLUnet', 'RigL', 'RigLLight', 'RigLLightUnet', 'StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparse64ExtremeSlim', 'StaticSparse64DecoderHeavy', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim', 'UnetSkipLess', 'SkipLess', 'NoSkip', 'RigLSkipLess', 'RigLNoSkip', 'STAMPUnet', 'STAMP'] or (self.type.startswith('RigL') and self.type[4:].isdigit()) or (self.type.startswith('UnetMasked') and self.type[10:].isdigit()) or (self.type.startswith('UnetMaskedDecoder') and self.type[17:].isdigit()) or (self.type.startswith('RigLSkipLess') and self.type[11:].isdigit()) or self.type.startswith('STAMP') or self.type.startswith('RigLStaticSparse'):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
