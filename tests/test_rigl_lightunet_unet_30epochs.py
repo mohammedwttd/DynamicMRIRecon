@@ -743,6 +743,18 @@ MODELS_TO_TEST = OrderedDict([
         'checkpoint': 'summary/16/cartesian_1_4_0.08_0.0005_fixed_RigL80_50',
         'description': 'UNet with RigL at 80% sparsity',
     }),
+    ('RigL90', {
+        'checkpoint': 'summary/16/cartesian_1_4_0.08_0.0005_fixed_RigL90_50',
+        'description': 'UNet with RigL at 90% sparsity',
+    }),
+    ('RigL95', {
+        'checkpoint': 'summary/16/cartesian_1_4_0.08_0.0005_fixed_RigL95_50',
+        'description': 'UNet with RigL at 95% sparsity',
+    }),
+    ('RigL99', {
+        'checkpoint': 'summary/16/cartesian_1_4_0.08_0.0005_fixed_RigL99_50',
+        'description': 'UNet with RigL at 99% sparsity',
+    }),
     ('LightUNet', {
         'checkpoint': 'summary/16/cartesian_1_4_0.08_0.0005_fixed_LightUNet_50',
         'description': 'Light UNet with 20 base channels',

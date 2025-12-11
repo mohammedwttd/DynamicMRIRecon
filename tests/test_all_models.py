@@ -40,84 +40,6 @@ def normalize(img):
     return (img - img.min()) / (img.max() - img.min() + 1e-8)
 
 
-def select_best_single_shot_sample(data_loader, device, verbose=True):
-    """
-    Select the best sample for single-shot adaptation based on sharpness and intensity.
-    
-    Selection criteria:
-    1. Calculate sharpness (Laplacian variance) - higher = sharper/more detail
-    2. Calculate signal intensity (avoid dark scans)
-    3. Sort by sharpness, pick top 10%
-    4. From top candidates, pick one with median intensity (representative noise level)
-    
-    Args:
-        data_loader: DataLoader for the dataset
-        device: Device to use
-        verbose: Print selection progress
-    
-    Returns:
-        dict with 'input', 'target', 'index', 'sharpness', 'intensity'
-    """
-    from scipy.ndimage import laplace
-    
-    if verbose:
-        print("\n  🔍 Selecting best single-shot sample...")
-    
-    candidates = []
-    
-    for idx, batch in enumerate(data_loader):
-        input_data, target, mean, std, norm = batch
-        
-        # Get target image for analysis (shape: B, H, W or B, C, H, W)
-        target_np = target.squeeze().cpu().numpy()
-        if target_np.ndim > 2:
-            target_np = target_np[0]  # Take first if batch/channel dim exists
-        
-        # Normalize to [0, 1] for consistent analysis
-        target_norm = (target_np - target_np.min()) / (target_np.max() - target_np.min() + 1e-8)
-        
-        # Calculate sharpness (Laplacian variance)
-        laplacian = laplace(target_norm)
-        sharpness = np.var(laplacian)
-        
-        # Calculate signal intensity (mean of normalized image)
-        intensity = np.mean(target_norm)
-        
-        candidates.append({
-            'index': idx,
-            'input': input_data,
-            'target': target,
-            'mean': mean,
-            'std': std,
-            'norm': norm,
-            'sharpness': sharpness,
-            'intensity': intensity
-        })
-        
-        if verbose and (idx + 1) % 100 == 0:
-            print(f"    Analyzed {idx + 1}/{len(data_loader)} samples...")
-    
-    if not candidates:
-        return None
-    
-    # Sort by sharpness (descending) and take top 10%
-    candidates.sort(key=lambda x: x['sharpness'], reverse=True)
-    top_count = max(1, len(candidates) // 10)
-    top_candidates = candidates[:top_count]
-    
-    if verbose:
-        print(f"    Top {top_count} sharpest samples (sharpness range: {top_candidates[-1]['sharpness']:.6f} - {top_candidates[0]['sharpness']:.6f})")
-    
-    # From the sharpest, pick one with median intensity
-    top_candidates.sort(key=lambda x: x['intensity'])
-    best_sample = top_candidates[len(top_candidates) // 2]
-    
-    if verbose:
-        print(f"    ✅ Selected sample #{best_sample['index']} (sharpness={best_sample['sharpness']:.6f}, intensity={best_sample['intensity']:.4f})")
-    
-    return best_sample
-
-
 class DataTransform:
     """Transform for test data."""
     def __init__(self, resolution):
@@ -517,7 +439,7 @@ def evaluate_model(model, data_loader, device, model_name="Model"):
 
 
 def single_shot_evaluate(model, data_loader, device, masks, criterion, model_name="Model",
-                         num_steps=20, lr=1e-3, save_dir=None, selected_sample=None):
+                         num_steps=20, lr=1e-3, save_dir=None):
     """
     Single-shot adaptation using FrozenMaskTrainer: adapt on first sample using pruned weights.
     
@@ -536,8 +458,6 @@ def single_shot_evaluate(model, data_loader, device, masks, criterion, model_nam
         num_steps: Number of adaptation steps on first sample
         lr: Learning rate for adaptation
         save_dir: Directory to save best adapted model (None = don't save)
-        selected_sample: Pre-selected sample dict from select_best_single_shot_sample()
-                        If None, uses first sample from data_loader
     
     Returns:
         Dict with metrics including loss_before, loss_after, psnr, ssim
@@ -549,21 +469,12 @@ def single_shot_evaluate(model, data_loader, device, masks, criterion, model_nam
     
     resolution = 320
     
-    # Get sample for adaptation (pre-selected or first)
-    if selected_sample is not None:
-        adapt_input = selected_sample['input'].to(device)
-        adapt_target = selected_sample['target'].to(device)
-        sample_idx = selected_sample['index']
-        print(f"  Using pre-selected sample #{sample_idx} (sharpness={selected_sample['sharpness']:.6f})")
-        # Create iterator skipping the selected sample for evaluation
-        data_iter = iter(data_loader)
-    else:
-        data_iter = iter(data_loader)
-        adapt_batch = next(data_iter)
-        adapt_input, adapt_target, _, _, _ = adapt_batch
-        adapt_input = adapt_input.to(device)
-        adapt_target = adapt_target.to(device)
-        sample_idx = 0
+    # Get first sample for adaptation
+    data_iter = iter(data_loader)
+    adapt_batch = next(data_iter)
+    adapt_input, adapt_target, _, _, _ = adapt_batch
+    adapt_input = adapt_input.to(device)
+    adapt_target = adapt_target.to(device)
     
     # Prepare input shape (add channel dim if needed)
     adapt_input_model = adapt_input.unsqueeze(1)  # (B, 1, H, W, 2)
@@ -971,18 +882,6 @@ def evaluate_on_dataset(models_to_test, data_loader, device, args, dataset_name=
     results = {}
     loaded_models = {}  # Cache loaded models for reuse
     
-    # Pre-select best single-shot sample once for all RigL models
-    selected_sample = None
-    if getattr(args, 'single_shot', False):
-        rigl_models = [m for m in models_to_test if m.startswith('RigL')]
-        if rigl_models:
-            print(f"\n  📊 Single-shot enabled for {len(rigl_models)} RigL models on {dataset_name}")
-            selected_sample = select_best_single_shot_sample(data_loader, device, verbose=True)
-            if selected_sample:
-                print(f"  ✅ Will use sample #{selected_sample['index']} for all RigL single-shot adaptations")
-            else:
-                print(f"  ⚠️  Could not select sample, will use first sample")
-    
     for model_name in models_to_test:
         if model_name not in TRAINED_MODELS:
             print(f"\nWarning: Model '{model_name}' not found in trained models list. Skipping.")
@@ -1052,8 +951,7 @@ def evaluate_on_dataset(models_to_test, data_loader, device, args, dataset_name=
                     model_name=model_name,
                     num_steps=args.single_shot_steps,
                     lr=args.single_shot_lr,
-                    save_dir=getattr(args, 'single_shot_save_dir', None),
-                    selected_sample=selected_sample
+                    save_dir=getattr(args, 'single_shot_save_dir', None)
                 )
                 if 'loss_before' in metrics:
                     print(f"  Loss: {metrics['loss_before']:.6f} → {metrics['loss_after']:.6f} (best: {metrics['best_loss']:.6f} @ step {metrics['best_step']})")
