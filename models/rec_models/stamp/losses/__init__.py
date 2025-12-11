@@ -1,0 +1,2 @@
+# STAMP losses
+from .dice_loss import dice_loss
