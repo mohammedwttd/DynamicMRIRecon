@@ -439,13 +439,14 @@ def evaluate_model(model, data_loader, device, model_name="Model"):
 
 
 def single_shot_evaluate(model, data_loader, device, masks, criterion, model_name="Model",
-                         num_steps=20, lr=1e-4, save_dir=None):
+                         num_steps=20, lr=1e-3, save_dir=None):
     """
-    Single-shot adaptation: adapt on first sample using pruned weights, evaluate on rest.
+    Single-shot adaptation using FrozenMaskTrainer: adapt on first sample using pruned weights.
     
-    This trains ONLY the pruned (zero) weights on the first sample, then evaluates
-    the adapted model on the remaining samples. This tests if the pruned capacity
-    can be recovered through test-time adaptation.
+    Uses FrozenMaskTrainer which handles:
+    - Xavier reinitialization of pruned weights
+    - Freezing active (learned) weights during adaptation
+    - Tracking and restoring best weights
     
     Args:
         model: The model to evaluate
@@ -461,9 +462,11 @@ def single_shot_evaluate(model, data_loader, device, masks, criterion, model_nam
     Returns:
         Dict with metrics including loss_before, loss_after, psnr, ssim
     """
-    import copy
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from train import FrozenMaskTrainer
     
-    model.eval()
     resolution = 320
     
     # Get first sample for adaptation
@@ -473,132 +476,82 @@ def single_shot_evaluate(model, data_loader, device, masks, criterion, model_nam
     adapt_input = adapt_input.to(device)
     adapt_target = adapt_target.to(device)
     
-    # Compute loss before adaptation
+    # Prepare input shape (add channel dim if needed)
+    adapt_input_model = adapt_input.unsqueeze(1)  # (B, 1, H, W, 2)
+    
+    # Reshape target to match output
+    if adapt_target.dim() == 4:  # (B, C, H, W)
+        adapt_target_reshaped = adapt_target.squeeze(1)  # (B, H, W)
+    elif adapt_target.dim() == 3 and adapt_target.shape[0] != 1:
+        adapt_target_reshaped = adapt_target.unsqueeze(0)  # Add batch dim
+    else:
+        adapt_target_reshaped = adapt_target
+    
+    # Compute loss BEFORE adaptation (with zeros in pruned positions)
+    model.eval()
     with torch.no_grad():
-        adapt_output = model(adapt_input.unsqueeze(1))
-        # Reshape target to match output
-        if adapt_target.dim() == 4:  # (B, C, H, W)
-            adapt_target_reshaped = adapt_target.squeeze(1)  # (B, H, W)
-        elif adapt_target.dim() == 3 and adapt_target.shape[0] != 1:
-            adapt_target_reshaped = adapt_target.unsqueeze(0)  # Add batch dim
-        else:
-            adapt_target_reshaped = adapt_target
-        # Reshape output if needed
+        adapt_output = model(adapt_input_model)
         if adapt_output.dim() == 1:
             adapt_output = adapt_output.view(1, resolution, resolution)
-        loss_before = criterion(adapt_output, adapt_target_reshaped).item()
+        loss_with_zeros = criterion(adapt_output, adapt_target_reshaped).item()
     
-    # Create optimizer for masked (pruned) parameters only
-    params_to_adapt = []
-    param_to_mask = {}  # Map param name to mask key
+    print(f"\n  [{model_name}] Single-shot adaptation using FrozenMaskTrainer...")
+    print(f"  Loss with zeros (before reinit): {loss_with_zeros:.6f}")
     
-    for name, param in model.named_parameters():
-        # Get layer name (without .weight/.bias suffix)
-        layer_name = name.rsplit('.', 1)[0] if name.endswith(('.weight', '.bias')) else name
-        
-        if layer_name in masks and name.endswith('.weight'):
-            param.requires_grad = True
-            params_to_adapt.append(param)
-            param_to_mask[name] = layer_name
-        else:
-            param.requires_grad = False
+    # Create FrozenMaskTrainer (handles Xavier reinit automatically)
+    trainer = FrozenMaskTrainer(model, masks, device=device, reinit='xavier')
     
-    if not params_to_adapt:
-        print(f"  Warning: No masked parameters found for single-shot adaptation")
-        # Fall back to standard evaluation
-        model.eval()
-        for param in model.parameters():
-            param.requires_grad = False
-        return evaluate_model(model, data_loader, device, model_name)
+    # Compute loss AFTER Xavier reinit
+    model.eval()
+    with torch.no_grad():
+        adapt_output = model(adapt_input_model)
+        if adapt_output.dim() == 1:
+            adapt_output = adapt_output.view(1, resolution, resolution)
+        loss_after_reinit = criterion(adapt_output, adapt_target_reshaped).item()
+    print(f"  Loss after Xavier reinit: {loss_after_reinit:.6f}")
     
-    optimizer = torch.optim.Adam(params_to_adapt, lr=lr)
+    # Single-shot adaptation using trainer
+    losses, _ = trainer.single_shot_adapt(
+        adapt_input_model, adapt_target_reshaped, criterion, 
+        num_steps=num_steps, lr=lr
+    )
     
-    # Adaptation loop - train only pruned weights on first sample
-    # Track best state during adaptation
-    model.train()
-    losses = []
-    best_loss = float('inf')
-    best_step = 0
-    best_masked_params = {}  # Store best pruned weight values
-    best_model_state = None
-    
-    for step in range(num_steps):
-        optimizer.zero_grad()
-        output = model(adapt_input.unsqueeze(1))
-        # Reshape output to match target
-        if output.dim() == 1:
-            output = output.view(1, resolution, resolution)
-        loss = criterion(output, adapt_target_reshaped)
-        loss.backward()
-        
-        # Only update pruned positions (where mask is 0)
-        for name, param in model.named_parameters():
-            if name in param_to_mask and param.grad is not None:
-                mask_key = param_to_mask[name]
-                mask = masks[mask_key].to(device)
-                # Gradient only for pruned positions (where mask is 0)
-                param.grad.mul_(1 - mask)
-        
-        optimizer.step()
-        current_loss = loss.item()
-        losses.append(current_loss)
-        
-        # Save best state
-        if current_loss < best_loss:
-            best_loss = current_loss
-            best_step = step + 1
-            # Save only the masked (pruned) parameter values
-            best_masked_params = {}
-            for name, param in model.named_parameters():
-                if name in param_to_mask:
-                    mask_key = param_to_mask[name]
-                    mask = masks[mask_key].to(device)
-                    # Extract only pruned values (where mask is 0)
-                    pruned_mask = (1 - mask).bool()
-                    best_masked_params[name] = {
-                        'values': param.data[pruned_mask].cpu().clone(),
-                        'mask': pruned_mask.cpu()
-                    }
-            # Also save full model state for convenience
-            best_model_state = copy.deepcopy(model.state_dict())
-    
+    loss_before = loss_after_reinit  # Use post-reinit as baseline
     loss_after = losses[-1] if losses else loss_before
+    best_loss = min(losses) if losses else loss_before
+    best_step = losses.index(best_loss) + 1 if losses else 0
     
-    # Restore best model state
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"  📌 Restored best state from step {best_step} (loss: {best_loss:.6f})")
+    # Print adaptation summary
+    print(f"\n  ════════════════════════════════════════════════════════")
+    print(f"  SINGLE-SHOT ADAPTATION COMPLETE")
+    print(f"  ════════════════════════════════════════════════════════")
+    print(f"  Loss (with zeros):     {loss_with_zeros:.6f}")
+    print(f"  Loss (after reinit):   {loss_after_reinit:.6f}")
+    print(f"  Loss (after adapt):    {best_loss:.6f} (step {best_step}/{num_steps})")
+    if loss_after_reinit > 0:
+        improvement_pct = 100 * (loss_after_reinit - best_loss) / loss_after_reinit
+        print(f"  Improvement:           {loss_after_reinit - best_loss:.6f} ({improvement_pct:.1f}%)")
+    print(f"  ════════════════════════════════════════════════════════")
+    print(f"  Now evaluating on remaining samples...\n")
     
-    # Save best adapted model and masked parameters
+    # Save adapted model if requested
     saved_paths = {}
     if save_dir is not None:
-        import os
         os.makedirs(save_dir, exist_ok=True)
         
         # Save full adapted model
         model_path = os.path.join(save_dir, f"{model_name}_singleshot_adapted.pt")
         torch.save({
-            'model_state_dict': best_model_state,
+            'model_state_dict': model.state_dict(),
             'best_step': best_step,
             'best_loss': best_loss,
-            'loss_before': loss_before,
+            'loss_with_zeros': loss_with_zeros,
+            'loss_after_reinit': loss_after_reinit,
             'adaptation_steps': num_steps,
             'learning_rate': lr,
         }, model_path)
         saved_paths['model'] = model_path
         print(f"  💾 Saved adapted model to: {model_path}")
-        
-        # Save only the masked (pruned) parameters
-        masked_params_path = os.path.join(save_dir, f"{model_name}_best_masked_params.pt")
-        torch.save({
-            'masked_params': best_masked_params,
-            'masks': {k: v.cpu() for k, v in masks.items()},
-            'best_step': best_step,
-            'best_loss': best_loss,
-            'loss_before': loss_before,
-        }, masked_params_path)
-        saved_paths['masked_params'] = masked_params_path
-        print(f"  💾 Saved best masked params to: {masked_params_path}")
     
     # Evaluate on remaining samples
     model.eval()
@@ -640,6 +593,8 @@ def single_shot_evaluate(model, data_loader, device, masks, criterion, model_nam
     eval_time = time.time() - start_time
     
     return {
+        'loss_with_zeros': loss_with_zeros,
+        'loss_after_reinit': loss_after_reinit,
         'loss_before': loss_before,
         'loss_after': loss_after,
         'best_loss': best_loss,
@@ -1065,8 +1020,8 @@ def main():
                         help='Enable single-shot adaptation for RigL models')
     parser.add_argument('--single-shot-steps', type=int, default=20,
                         help='Number of adaptation steps for single-shot (default: 20)')
-    parser.add_argument('--single-shot-lr', type=float, default=1e-4,
-                        help='Learning rate for single-shot adaptation (default: 1e-4)')
+    parser.add_argument('--single-shot-lr', type=float, default=1e-3,
+                        help='Learning rate for single-shot adaptation (default: 1e-3)')
     parser.add_argument('--single-shot-save-dir', type=str, default=None,
                         help='Directory to save best adapted models and masked params (default: None)')
     # Model filtering options
