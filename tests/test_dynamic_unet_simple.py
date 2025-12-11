@@ -10,7 +10,7 @@ This script demonstrates:
 
 import torch
 import torch.nn as nn
-from models.rec_models.dynamic_unet_model import DynamicUnetModel
+from models.rec_models.models.dynamic_unet_model import DynamicUnetModel
 
 
 def test_dynamic_unet():

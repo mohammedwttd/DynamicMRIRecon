@@ -9,7 +9,7 @@ Tests basic functionality including:
 
 import torch
 import torch.nn as nn
-from models.rec_models.cond_unet_model import CondUnetModel
+from models.rec_models.models.cond_unet_model import CondUnetModel
 
 
 def test_basic_forward():
@@ -56,7 +56,7 @@ def test_parameter_count(model):
     print(f"Total parameters: {total_params:,}")
     
     # Compare with regular U-Net (approximately)
-    from models.rec_models.unet_model import UnetModel
+    from models.rec_models.models.unet_model import UnetModel
     unet = UnetModel(
         in_chans=2,
         out_chans=2,
@@ -161,7 +161,7 @@ def test_comparison_with_unet():
     print("Test 6: Comparison with Regular U-Net")
     print("=" * 80)
     
-    from models.rec_models.unet_model import UnetModel
+    from models.rec_models.models.unet_model import UnetModel
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     x = torch.randn(2, 2, 128, 128, device=device)
