@@ -241,6 +241,24 @@ class StaticSparseUNet(nn.Module):
                 'up_3': 64,
             }
             self.channel_mult = {k: 1.0 for k in self.explicit_channels}
+            
+        elif sparsity_level == 'wide64_decoder_heavy':
+            # Shifted toward decoder (RigL-inspired: slim encoder, fuller decoder)
+            # Encoder is compressed, decoder has more capacity
+            # Channels: 64 -> 64 -> 64 -> 48 | bottle=48 | 96 -> 128 -> 128 -> 64
+            self.use_explicit_channels = True
+            self.explicit_channels = {
+                'down_0': 64,   # Full at input
+                'down_1': 64,   # Slim (was 128)
+                'down_2': 64,   # Slim (was 128)
+                'down_3': 48,   # Very slim (was 96)
+                'bottleneck': 48,   # Compressed bottleneck
+                'up_0': 96,     # Fuller decoder
+                'up_1': 128,    # Peak capacity in decoder
+                'up_2': 128,    # High capacity
+                'up_3': 64,     # Full at output
+            }
+            self.channel_mult = {k: 1.0 for k in self.explicit_channels}
         elif sparsity_level == 'asymmetric_rigl':
             # EXACT MATCH of RigL60-learned parameter distribution
             # Following UnetModel pattern: bottleneck keeps same channels (ch -> ch)
@@ -432,7 +450,7 @@ if __name__ == '__main__':
     
     print("-" * 80)
     
-    for level in ['light', 'medium', 'heavy', 'wide_slim', 'ultralight', 'flat32', 'wide64_extreme', 'asymmetric_rigl', 'asymmetric_slim']:
+    for level in ['light', 'medium', 'heavy', 'wide_slim', 'ultralight', 'flat32', 'wide64_extreme', 'wide64_extreme_slim', 'wide64_decoder_heavy', 'asymmetric_rigl', 'asymmetric_slim']:
         model = StaticSparseUNet(sparsity_level=level)
         counts = model.get_param_count()
         reduction = 100 * (1 - counts['total'] / standard_params)
@@ -447,7 +465,7 @@ if __name__ == '__main__':
     print("\n" + "=" * 80)
     print("Forward pass test:")
     x = torch.randn(1, 1, 320, 320)
-    for level in ['light', 'medium', 'heavy', 'wide_slim', 'ultralight', 'flat32', 'wide64_extreme', 'asymmetric_rigl', 'asymmetric_slim']:
+    for level in ['light', 'medium', 'heavy', 'wide_slim', 'ultralight', 'flat32', 'wide64_extreme', 'wide64_extreme_slim', 'wide64_decoder_heavy', 'asymmetric_rigl', 'asymmetric_slim']:
         model = StaticSparseUNet(sparsity_level=level)
         y = model(x)
         print(f"  {level}: input {x.shape} -> output {y.shape}")
