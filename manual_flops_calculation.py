@@ -11,9 +11,9 @@ This script manually calculates FLOPs for all operations.
 
 import torch
 import numpy as np
-from models.rec_models.unet_model import UnetModel
-from models.rec_models.fd_unet_model import FDUnetModel
-from models.rec_models.hybrid_snake_fd_unet import HybridSnakeFDUnet
+from models.rec_models.models.unet_model import UnetModel
+from models.rec_models.models.fd_unet_model import FDUnetModel
+from models.rec_models.models.hybrid_snake_fd_unet import HybridSnakeFDUnet
 
 
 def count_conv2d_flops(in_channels, out_channels, kernel_size, input_h, input_w, groups=1):

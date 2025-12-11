@@ -10,9 +10,9 @@ This script helps you choose which model to train for your experiments.
 """
 
 import torch
-from models.rec_models.unet_model import UnetModel
-from models.rec_models.hybrid_cond_unet import HybridCondUnetModel
-from models.rec_models.small_cond_unet import SmallCondUnetModel
+from models.rec_models.models.unet_model import UnetModel
+from models.rec_models.models.hybrid_cond_unet import HybridCondUnetModel
+from models.rec_models.models.small_cond_unet import SmallCondUnetModel
 
 
 def count_params(model):

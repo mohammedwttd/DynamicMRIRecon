@@ -12,13 +12,13 @@ Note: Install required packages first:
 
 import torch
 import sys
-from models.rec_models.unet_model import UnetModel
-from models.rec_models.dynamic_unet_model import DynamicUnetModel
-from models.rec_models.cond_unet_model import CondUnetModel
-from models.rec_models.hybrid_cond_unet import HybridCondUnetModel
-from models.rec_models.small_cond_unet import SmallCondUnetModel
-from models.rec_models.fd_unet_model import FDUnetModel
-from models.rec_models.hybrid_snake_fd_unet import HybridSnakeFDUnet
+from models.rec_models.models.unet_model import UnetModel
+from models.rec_models.models.dynamic_unet_model import DynamicUnetModel
+from models.rec_models.models.cond_unet_model import CondUnetModel
+from models.rec_models.models.hybrid_cond_unet import HybridCondUnetModel
+from models.rec_models.models.small_cond_unet import SmallCondUnetModel
+from models.rec_models.models.fd_unet_model import FDUnetModel
+from models.rec_models.models.hybrid_snake_fd_unet import HybridSnakeFDUnet
 
 
 def count_parameters(model):
