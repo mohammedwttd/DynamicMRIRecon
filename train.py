@@ -50,6 +50,35 @@ import logging
 import torchvision.models as models
 
 
+def _get_train_dataset_name(args) -> str:
+    """
+    Human-readable training dataset name to embed in run directories.
+    - Defaults to 'fastmri' for MRI training (args.dataset == 'mri')
+    - Defaults to 'imagenet' for ImageNet training
+    - Can be overridden via --train-dataset-name
+    """
+    override = getattr(args, "train_dataset_name", None)
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    dataset_type = getattr(args, "dataset", "mri")
+    if dataset_type == "imagenet":
+        return "imagenet"
+    return "fastmri"
+
+
+def _count_parameters(model) -> int:
+    return int(sum(p.numel() for p in model.parameters()))
+
+
+def _format_param_count(n: int) -> str:
+    # Path-safe, readable.
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.2f}K"
+    return str(n)
+
+
 class DecoderOnlyMaskTrainer:
     """
     Decoder-only inverse mask training: 
@@ -396,8 +425,36 @@ def load_rigl_checkpoint(checkpoint_path, model, device='cuda'):
     print(f"\n{'='*70}")
     print(f"Loading RigL checkpoint: {checkpoint_path}")
     print(f"{'='*70}")
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Allow passing either:
+    # - a direct .pt file path
+    # - a checkpoint directory (containing best_model.pt/model.pt)
+    # - an old-style directory/file prefix that now has a suffix like:
+    #   *_train-<dataset>_params-<N>/
+    ckpt_path = pathlib.Path(str(checkpoint_path))
+    if ckpt_path.is_dir():
+        if (ckpt_path / "best_model.pt").exists():
+            ckpt_path = ckpt_path / "best_model.pt"
+        elif (ckpt_path / "model.pt").exists():
+            ckpt_path = ckpt_path / "model.pt"
+
+    if not ckpt_path.exists():
+        # If user passed ".../<run>/best_model.pt" but run dir now has a suffix, try glob.
+        parent = ckpt_path.parent.parent if ckpt_path.suffix == ".pt" else ckpt_path.parent
+        base_dir = ckpt_path.parent.name if ckpt_path.suffix == ".pt" else ckpt_path.name
+        file_name = ckpt_path.name if ckpt_path.suffix == ".pt" else "best_model.pt"
+
+        try:
+            matches = sorted(parent.glob(base_dir + "_train-*_params-*"))
+        except Exception:
+            matches = []
+
+        if matches:
+            candidate = matches[-1] / file_name
+            if candidate.exists():
+                ckpt_path = candidate
+
+    checkpoint = torch.load(str(ckpt_path), map_location=device)
     
     # Load model weights
     if 'model' in checkpoint:
@@ -793,7 +850,7 @@ def select_top_perturbations_balanced(model, image, target, mask_module, loss_fn
     return final_mask.view_as(perturbation_mask)
 
 
-def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask = None, rigl_scheduler = None, frozen_mask_trainer = None):
+def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask = None, rigl_scheduler = None, frozen_mask_trainer = None, stamp_scheduler = None):
     model.train()
     avg_loss = 0.
 
@@ -877,6 +934,20 @@ def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, write
 
 
         output = model(input.unsqueeze(1))
+        
+        # STAMP: Collect subsampled images for importance computation
+        # The subsampling layer converts k-space to image domain
+        if stamp_scheduler is not None and iter % 50 == 0:  # Collect every 50th batch
+            try:
+                # Get the subsampled image (after k-space to image)
+                with torch.no_grad():
+                    subsampled_input = model.module.subsampling(input.unsqueeze(1))
+                    if subsampled_input.dim() == 3:
+                        subsampled_input = subsampled_input.unsqueeze(1)
+                    stamp_scheduler.collect_batch(subsampled_input, target.view_as(subsampled_input))
+            except Exception as e:
+                pass  # Silently skip if collection fails
+        
         x = model.module.get_trajectory()
         # v, a = get_vel_acc(x)
         # acc_loss = torch.sqrt(torch.sum(torch.pow(F.softshrink(a, args.a_max).abs() + 1e-8, 2)))
@@ -899,11 +970,22 @@ def train_epoch(args, epoch, model, data_loader, optimizer, optimizer_sub, write
 
         if not done:
             done = True
-            save_dir = f"Images_{args.model}/{args.test_name}/{epoch}"
+            # Global images directory: Images/<model>/<run>/<epoch_###>/
+            # (keeps all images under one root, then per-model)
+            save_dir = os.path.join("Images", str(args.model), str(args.test_name), f"epoch_{epoch:03d}")
             os.makedirs(save_dir, exist_ok=True)
-            save_path = f"{save_dir}/{iter}.png"
-            save_image(torch.stack([output[0].view(resolution, resolution),
-                                    target[0].view(resolution, resolution)]), save_path, f"{iter}")
+            # NOTE: save_image expects (folder_path, image_name) — previously we passed a filename
+            # which created nested ".../0.png/0.png" directories.
+            save_image(
+                torch.stack(
+                    [
+                        output[0].view(resolution, resolution),
+                        target[0].view(resolution, resolution),
+                    ]
+                ),
+                save_dir,
+                f"{iter}",
+            )
 
         data_min = target.min()
         data_max = target.max()
@@ -1381,7 +1463,6 @@ def train():
     args = create_arg_parser().parse_args()
 
     args.v_max = args.gamma * args.G_max * args.FOV * args.dt
-    args.exp_dir = f'summary/{args.test_name}'
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -1390,13 +1471,6 @@ def train():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    pathlib.Path(args.exp_dir).mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=args.exp_dir)
-    with open(args.exp_dir + '/args.txt', "w") as text_file:
-        print(vars(args), file=text_file)
-
-    print(args.test_name, flush=True)
-    args.checkpoint = f'summary/{args.test_name}/model.pt'
     optimizer = None
     g_params = None
     g_optimizer = None
@@ -1406,6 +1480,15 @@ def train():
 
     rigl_state = None  # Will be loaded from checkpoint if resuming with RigL
     if args.resume:
+        # Resume uses the already-established run directory name (do not rename).
+        args.exp_dir = f'summary/{args.test_name}'
+        pathlib.Path(args.exp_dir).mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=args.exp_dir)
+        with open(args.exp_dir + '/args.txt', "w") as text_file:
+            print(vars(args), file=text_file)
+        print(args.test_name, flush=True)
+        args.checkpoint = f'summary/{args.test_name}/model.pt'
+
         checkpoint, model, optimizer = load_model(args.checkpoint)
         # args = checkpoint['args']
         best_dev_loss = checkpoint['best_dev_loss']
@@ -1428,6 +1511,24 @@ def train():
             model.module.reconstruction_model.load_state_dict(checkpoint['model_state_dict'])
         optimizer, optimizer_sub = build_optim(args, model)
         scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
+
+        # Finalize run naming AFTER the model is built so we can embed parameter count.
+        train_ds_name = _get_train_dataset_name(args)
+        param_count = _count_parameters(model)
+        args.num_parameters = param_count
+        args.train_dataset_name = train_ds_name
+
+        suffix = f"_train-{train_ds_name}_params-{param_count}"
+        if suffix not in str(args.test_name):
+            args.test_name = f"{args.test_name}{suffix}"
+
+        args.exp_dir = f"summary/{args.test_name}"
+        pathlib.Path(args.exp_dir).mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=args.exp_dir)
+        with open(args.exp_dir + '/args.txt', "w") as text_file:
+            print(vars(args), file=text_file)
+        print(args.test_name, flush=True)
+        args.checkpoint = f'summary/{args.test_name}/model.pt'
 
         best_dev_loss = 1e9
         best_psnr_mean = 0
@@ -1455,7 +1556,9 @@ def train():
             update_freq=rigl_update_freq,
             T_end=int(total_iters * 0.75),  # Stop mask updates at 75% of training
             delta=args.rigl_delta,
-            exclude_layers=['first', 'final', 'conv.0'],  # Exclude first/last layers
+            exclude_layers=[],  # Don't skip any layers - apply RigL to all
+            initial_masks_path=args.rigl_initial_mask,
+            static_mask=args.rigl_static_mask,
         )
         print(f"\n*** RigL Enabled: {args.rigl_sparsity*100:.0f}% sparsity, update every {rigl_update_freq} iters (2x per epoch) ***")
         print(f"*** Iters per epoch: {iters_per_epoch}, Total iterations: {total_iters}, T_end: {int(total_iters * 0.75)} ***\n")
@@ -1515,18 +1618,31 @@ def train():
     for epoch in range(start_epoch, args.num_epochs):
         if noise_behaviour == "log":
             model.module.subsampling.epsilon = np.logspace(np.log10(args.epsilon), np.log10(args.end_epsilon), num=args.num_epochs)[epoch]
-        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask, rigl_scheduler, frozen_mask_trainer)
+        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, optimizer_sub, writer, scheduler, scheduler_sub, adv_mask, rigl_scheduler, frozen_mask_trainer, stamp_scheduler)
         
-        # STAMP: Update dropout probabilities based on filter importance
+        # STAMP: Update dropout probabilities based on filter importance (uses collected images)
         if stamp_scheduler is not None:
-            # Pass data loader and L1 loss for computing filter importance
+            # Uses images collected during train_epoch (post-subsampling images)
             current_drop_rate = stamp_scheduler.step(
                 epoch, 
-                data_loader=train_loader, 
                 criterion=nn.L1Loss()
             )
             if epoch % 10 == 0:
                 print(f"  [STAMP] Epoch {epoch}: b_drop = {current_drop_rate*100:.1f}%")
+            
+            # Check if physical pruning occurred - need to recreate optimizer
+            if stamp_scheduler.check_and_reset_architecture_changed():
+                print(f"  [STAMP] Architecture changed! Recreating optimizer for pruned model...")
+                # Update the model in the wrapper if needed
+                if hasattr(model.module, 'reconstruction_model'):
+                    model.module.reconstruction_model = stamp_scheduler.get_model()
+                # Recreate optimizer with new model parameters
+                optimizer, optimizer_sub = build_optim(args, model)
+                # Recreate scheduler with remaining epochs
+                remaining_epochs = args.num_epochs - epoch
+                if remaining_epochs > 3:
+                    scheduler, scheduler_sub = build_scheduler(optimizer, optimizer_sub, args)
+                print(f"  [STAMP] Optimizer recreated successfully")
         
         # Dynamic U-Net: channel swapping happens automatically during training batches
         # (see train_epoch function where maybe_swap_channels() is called)
@@ -1558,6 +1674,13 @@ def train():
 def create_arg_parser():
     parser = Args()
     parser.add_argument('--test-name', type=str, default='gaussiantsp-d24-a1e-3-v1e-3', help='name for the output dir')
+    parser.add_argument(
+        '--train-dataset-name',
+        type=str,
+        default=None,
+        help='Optional: override the training dataset name embedded in run/checkpoint directories '
+             '(default: fastmri for --dataset=mri, imagenet for --dataset=imagenet).',
+    )
     parser.add_argument('--exp-dir', type=pathlib.Path, default='summary/testepi',
                         help='Path where model and results should be saved')
     parser.add_argument('--resume', action='store_true',
@@ -1682,6 +1805,10 @@ def create_arg_parser():
                         help='How often to update sparse masks (in iterations)')
     parser.add_argument('--rigl-delta', type=float, default=0.3,
                         help='Fraction of weights to reallocate each update')
+    parser.add_argument('--rigl-initial-mask', type=str, default=None,
+                        help='Path to pre-computed masks (.pt file from SNIP/PUN-IT) for RigL initialization')
+    parser.add_argument('--rigl-static-mask', action='store_true',
+                        help='Keep mask static (no RigL updates) - pure static sparse training')
     
     # Frozen mask training (sparse fine-tuning)
     parser.add_argument('--freeze-masked', action='store_true', default=False,
