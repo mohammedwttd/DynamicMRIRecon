@@ -284,11 +284,13 @@ class SliceDataset(torch.utils.data.Dataset):
 
         # subsample if desired
         if sample_rate < 1.0:  # sample by slice
+            random.seed(42)  # Fixed seed for reproducibility
             random.shuffle(self.examples)
             num_examples = round(len(self.examples) * sample_rate)
             self.examples = self.examples[:num_examples]
         elif volume_sample_rate < 1.0:  # sample by volume
             vol_names = sorted(list(set([f[0].stem for f in self.examples])))
+            random.seed(42)  # Fixed seed for reproducibility
             random.shuffle(vol_names)
             num_volumes = round(len(vol_names) * volume_sample_rate)
             sampled_vols = vol_names[:num_volumes]

@@ -27,6 +27,7 @@ class Unet(nn.Module):
         chans: int = 32,
         num_pool_layers: int = 4,
         drop_prob: float = 0.0,
+        lean: bool = False,
     ):
         """
         Args:
@@ -35,6 +36,9 @@ class Unet(nn.Module):
             chans: Number of output channels of the first convolution layer.
             num_pool_layers: Number of down-sampling and up-sampling layers.
             drop_prob: Dropout probability.
+            lean: If True, channels stay constant (no doubling at each level).
+                  Standard: 32->64->128->256->512 (~7.8M params)
+                  Lean:     32->32->32->32->32   (~0.3M params)
         """
         super().__init__()
 
@@ -43,28 +47,52 @@ class Unet(nn.Module):
         self.chans = chans
         self.num_pool_layers = num_pool_layers
         self.drop_prob = drop_prob
+        self.lean = lean
 
-        self.down_sample_layers = nn.ModuleList([ConvBlock(in_chans, chans, drop_prob)])
-        ch = chans
-        for _ in range(num_pool_layers - 1):
-            self.down_sample_layers.append(ConvBlock(ch, ch * 2, drop_prob))
-            ch *= 2
-        self.conv = ConvBlock(ch, ch * 2, drop_prob)
+        if lean:
+            # Lean mode: constant channels throughout
+            self.down_sample_layers = nn.ModuleList([ConvBlock(in_chans, chans, drop_prob)])
+            for _ in range(num_pool_layers - 1):
+                self.down_sample_layers.append(ConvBlock(chans, chans, drop_prob))
+            self.conv = ConvBlock(chans, chans, drop_prob)
 
-        self.up_conv = nn.ModuleList()
-        self.up_transpose_conv = nn.ModuleList()
-        for _ in range(num_pool_layers - 1):
-            self.up_transpose_conv.append(TransposeConvBlock(ch * 2, ch))
-            self.up_conv.append(ConvBlock(ch * 2, ch, drop_prob))
-            ch //= 2
+            self.up_conv = nn.ModuleList()
+            self.up_transpose_conv = nn.ModuleList()
+            for _ in range(num_pool_layers - 1):
+                # In lean mode, after transpose we have chans, after cat we have chans*2
+                self.up_transpose_conv.append(TransposeConvBlock(chans, chans))
+                self.up_conv.append(ConvBlock(chans * 2, chans, drop_prob))
 
-        self.up_transpose_conv.append(TransposeConvBlock(ch * 2, ch))
-        self.up_conv.append(
-            nn.Sequential(
-                ConvBlock(ch * 2, ch, drop_prob),
-                nn.Conv2d(ch, self.out_chans, kernel_size=1, stride=1),
+            self.up_transpose_conv.append(TransposeConvBlock(chans, chans))
+            self.up_conv.append(
+                nn.Sequential(
+                    ConvBlock(chans * 2, chans, drop_prob),
+                    nn.Conv2d(chans, self.out_chans, kernel_size=1, stride=1),
+                )
             )
-        )
+        else:
+            # Standard mode: channels double at each level
+            self.down_sample_layers = nn.ModuleList([ConvBlock(in_chans, chans, drop_prob)])
+            ch = chans
+            for _ in range(num_pool_layers - 1):
+                self.down_sample_layers.append(ConvBlock(ch, ch * 2, drop_prob))
+                ch *= 2
+            self.conv = ConvBlock(ch, ch * 2, drop_prob)
+
+            self.up_conv = nn.ModuleList()
+            self.up_transpose_conv = nn.ModuleList()
+            for _ in range(num_pool_layers - 1):
+                self.up_transpose_conv.append(TransposeConvBlock(ch * 2, ch))
+                self.up_conv.append(ConvBlock(ch * 2, ch, drop_prob))
+                ch //= 2
+
+            self.up_transpose_conv.append(TransposeConvBlock(ch * 2, ch))
+            self.up_conv.append(
+                nn.Sequential(
+                    ConvBlock(ch * 2, ch, drop_prob),
+                    nn.Conv2d(ch, self.out_chans, kernel_size=1, stride=1),
+                )
+            )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """

@@ -93,6 +93,7 @@ class MriModule(pl.LightningModule):
 
         # pick a set of images to log if we don't have one already
         if self.val_log_indices is None:
+            np.random.seed(42)  # Fixed seed for reproducibility
             self.val_log_indices = list(
                 np.random.permutation(len(self.trainer.val_dataloaders[0]))[
                     : self.num_log_images
