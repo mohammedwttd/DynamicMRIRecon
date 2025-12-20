@@ -35,6 +35,22 @@ from models.subsampling_model import Subsampling_Model
 from common.evaluate import psnr, ssim
 
 
+def resolve_checkpoint_dir(checkpoint_dir: str) -> pathlib.Path:
+    """
+    Backward/forward compatible checkpoint directory resolution.
+    New training runs may append: *_train-<dataset>_params-<N>
+    """
+    p = pathlib.Path(checkpoint_dir)
+    if p.exists():
+        return p
+    parent = p.parent
+    base = p.name
+    matches = sorted(parent.glob(base + "_train-*_params-*"))
+    if matches:
+        return matches[-1]
+    return p
+
+
 def normalize(img):
     """Normalize image to [0, 1] range."""
     return (img - img.min()) / (img.max() - img.min() + 1e-8)
@@ -888,11 +904,11 @@ def evaluate_on_dataset(models_to_test, data_loader, device, args, dataset_name=
             continue
         
         model_info = TRAINED_MODELS[model_name]
-        checkpoint_dir = model_info['checkpoint']
+        checkpoint_dir = resolve_checkpoint_dir(model_info['checkpoint'])
         
         # Choose best_model.pt or model.pt
         model_file = 'best_model.pt' if args.use_best else 'model.pt'
-        checkpoint_path = pathlib.Path(checkpoint_dir) / model_file
+        checkpoint_path = checkpoint_dir / model_file
         
         if not checkpoint_path.exists():
             print(f"\nWarning: Checkpoint not found: {checkpoint_path}. Skipping {model_name}.")
