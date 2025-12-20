@@ -3,7 +3,8 @@ from torch import nn
 from torch.nn import functional as F
 import json
 import fastmri.models
-from models.rec_models.models.unet_model import UnetModel
+from fastmri.models.unet import Unet as FastMRIUnet  # Use FastMRI Unet everywhere
+from models.rec_models.stamp.models.unet_model_targeted_dropout_2d import STAMPUnet  # STAMP Unet
 from models.rec_models.models.complex_unet import ComplexUnetModel
 from models.rec_models.models.dynamic_unet_model import DynamicUnetModel
 from models.rec_models.models.cond_unet_model import CondUnetModel
@@ -446,8 +447,24 @@ class Subsampling_Model(nn.Module):
             self.reconstruction_model = ReconNet(vitNet)
 
         elif type == 'Unet' or (type.startswith('UnetMasked') and type[10:].isdigit()) or (type.startswith('UnetMaskedDecoder') and type[17:].isdigit()):
-            # UnetMasked{X} and UnetMaskedDecoder{X} use standard UNet architecture, masks are applied during training
-            self.reconstruction_model = UnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob)
+            # UnetMasked{X} and UnetMaskedDecoder{X} use FastMRI UNet architecture, masks are applied during training
+            self.reconstruction_model = FastMRIUnet(in_chans, out_chans, chans, num_pool_layers, drop_prob)
+        elif type == 'LeanUnet' or type == 'LeanUnet32':
+            # LeanUnet32: constant 32 channels across all layers
+            # 32->32->32->32->32 (~0.21M params)
+            self.reconstruction_model = FastMRIUnet(in_chans, out_chans, 32, num_pool_layers, drop_prob, lean=True)
+        elif type == 'LeanUnet64':
+            # LeanUnet64: constant 64 channels across all layers
+            # 64->64->64->64->64 (~0.84M params)
+            self.reconstruction_model = FastMRIUnet(in_chans, out_chans, 64, num_pool_layers, drop_prob, lean=True)
+        elif type == 'LeanUnet128':
+            # LeanUnet128: constant 128 channels across all layers
+            # 128->128->128->128->128 (~3.35M params)
+            self.reconstruction_model = FastMRIUnet(in_chans, out_chans, 128, num_pool_layers, drop_prob, lean=True)
+        elif type == 'SmallUnet' or type == 'Unet20':
+            # SmallUnet/Unet20: starts with 20 channels, doubles normally
+            # 20->40->80->160->320 (~3.0M params)
+            self.reconstruction_model = FastMRIUnet(in_chans, out_chans, 20, num_pool_layers, drop_prob)
         elif type == 'DynamicUnet':
             self.reconstruction_model = DynamicUnetModel(in_chans, out_chans, chans, num_pool_layers, drop_prob,
                                                           swap_frequency=swap_frequency)
@@ -543,7 +560,7 @@ class Subsampling_Model(nn.Module):
         elif type in ['STAMPUnet', 'STAMP'] or type.startswith('STAMP'):
             # STAMP U-Net: Simultaneous Training and Model Pruning
             # Official implementation: https://github.com/nkdinsdale/STAMP.git
-            from models.rec_models.models.stamp_unet import STAMPUnet
+            from models.rec_models.stamp.models.unet_model_targeted_dropout_2d import STAMPUnet
             # Extract b_drop from model name if specified (e.g., STAMP20 = 0.2 b_drop)
             b_drop = 0.1  # Paper default
             mode = 'Taylor'  # Paper default: Taylor expansion
@@ -613,7 +630,7 @@ class Subsampling_Model(nn.Module):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
-        elif self.type in ['Unet', 'DynamicUnet', 'CondUnet', 'HybridCondUnet', 'SmallCondUnet', 'FDUnet', 'HybridSnakeFDUnet', 'SmallHybridSnakeFDUnet', 'DCNFDUnet', 'SmallDCNFDUnet', 'LightUNet', 'LightDCN', 'LightFD', 'LightDCNFD', 'LightDCNUnet', 'LightFDUnet', 'FullFDUnet', 'FullFD', 'LightFullFD', 'FullFDDCN', 'HybridFDUnet', 'HybridFD', 'HybridFDDCN', 'DeepFDUnet', 'DeepFD', 'DeepFDDCN', 'LightOD', 'LightODUnet', 'LightODDCN', 'RigLUnet', 'RigL', 'RigLLight', 'RigLLightUnet', 'StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparse64ExtremeSlim', 'StaticSparse64DecoderHeavy', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim', 'UnetSkipLess', 'SkipLess', 'NoSkip', 'RigLSkipLess', 'RigLNoSkip', 'STAMPUnet', 'STAMP'] or (self.type.startswith('RigL') and self.type[4:].isdigit()) or (self.type.startswith('UnetMasked') and self.type[10:].isdigit()) or (self.type.startswith('UnetMaskedDecoder') and self.type[17:].isdigit()) or (self.type.startswith('RigLSkipLess') and self.type[11:].isdigit()) or self.type.startswith('STAMP') or self.type.startswith('RigLStaticSparse'):
+        elif self.type in ['Unet', 'DynamicUnet', 'CondUnet', 'HybridCondUnet', 'SmallCondUnet', 'FDUnet', 'HybridSnakeFDUnet', 'SmallHybridSnakeFDUnet', 'DCNFDUnet', 'SmallDCNFDUnet', 'LightUNet', 'LightDCN', 'LightFD', 'LightDCNFD', 'LightDCNUnet', 'LightFDUnet', 'FullFDUnet', 'FullFD', 'LightFullFD', 'FullFDDCN', 'HybridFDUnet', 'HybridFD', 'HybridFDDCN', 'DeepFDUnet', 'DeepFD', 'DeepFDDCN', 'LightOD', 'LightODUnet', 'LightODDCN', 'RigLUnet', 'RigL', 'RigLLight', 'RigLLightUnet', 'StaticSparseLight', 'StaticSparseMedium', 'StaticSparseHeavy', 'StaticSparse', 'StaticSparse48Wide', 'StaticSparseUltraLight', 'StaticSparseFlat32', 'StaticSparse64Extreme', 'StaticSparse64ExtremeSlim', 'StaticSparse64DecoderHeavy', 'StaticSparseAsymmetric', 'StaticSparseAsymmetricSlim', 'UnetSkipLess', 'SkipLess', 'NoSkip', 'RigLSkipLess', 'RigLNoSkip', 'STAMPUnet', 'STAMP', 'LeanUnet', 'LeanUnet32', 'LeanUnet64', 'LeanUnet128', 'SmallUnet', 'Unet20'] or (self.type.startswith('RigL') and self.type[4:].isdigit()) or (self.type.startswith('UnetMasked') and self.type[10:].isdigit()) or (self.type.startswith('UnetMaskedDecoder') and self.type[17:].isdigit()) or (self.type.startswith('RigLSkipLess') and self.type[11:].isdigit()) or self.type.startswith('STAMP') or self.type.startswith('RigLStaticSparse'):
             input = self.subsampling(input)
             output = self.reconstruction_model(input).reshape(-1, 320, 320)
             return output
