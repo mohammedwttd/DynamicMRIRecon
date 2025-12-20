@@ -164,7 +164,9 @@ class FilterPrunner2D():
         activation = self.activations[activation_index]
 
         if activation.size(1) != 1:
-            random = torch.rand(activation.size(1))
+            # Use fixed seed for reproducibility
+            generator = torch.Generator().manual_seed(42 + activation_index)
+            random = torch.rand(activation.size(1), generator=generator)
         else:
             random = torch.ones(activation.size(1)) * 100
 
@@ -242,42 +244,8 @@ class PruningController2D():
         loss = self.criterion(output, target)
         loss.backward()
 
-    def compute_ranks_epoch(self, data_loader, num_batches=None):
-        """Compute filter ranks over multiple batches."""
-        self.pruner.reset()
-        self.unet.train()
-        
-        for i, batch in enumerate(data_loader):
-            if num_batches is not None and i >= num_batches:
-                break
-            
-            # Handle different batch formats from DynamicMRIRecon
-            if isinstance(batch, dict):
-                # Typical fastMRI format
-                if 'input' in batch:
-                    data = batch['input']
-                    target = batch.get('target', batch.get('target_img', data))
-                elif 'kspace' in batch:
-                    # Skip k-space data, need preprocessed input
-                    continue
-                else:
-                    continue
-            elif isinstance(batch, (list, tuple)):
-                if len(batch) >= 2:
-                    data, target = batch[0], batch[1]
-                else:
-                    data = batch[0]
-                    target = batch[0]
-            else:
-                data = batch
-                target = batch
-            
-            try:
-                self.compute_ranks(data, target)
-            except Exception as e:
-                print(f"[FilterPrunner2D] Batch {i} failed: {e}")
-                continue
-        
+    def get_ranks(self):
+        """Get normalized filter ranks after computing importance."""
         self.pruner.normalize_ranks_per_layer()
         return self.pruner.return_ranks
 
@@ -295,13 +263,14 @@ class PruningController2D():
         """Get pruning candidates."""
         return self.pruner.get_prunning_plan(num_filters_to_prune), self.pruner.return_ranks
 
-    def prune(self, num_filters=None):
+    def prune(self, num_filters=None, physical_prune=True):
         """
         Prune filters from the network.
         
-        Note: For simplicity, this version updates dropout probabilities
-        rather than physically removing filters, which is more stable
-        for MRI reconstruction tasks.
+        Args:
+            num_filters: Number of filters to prune (default: prune_percentage)
+            physical_prune: If True, physically removes filters from the network.
+                           If False, only returns ranks for dropout update.
         
         Returns:
             returned_ranks: Filter importance ranks for updating dropout
@@ -317,23 +286,69 @@ class PruningController2D():
         print(f'[STAMP Prune] Total filters: {number_of_filters}')
 
         # Get pruning plan and ranks
-        prune_plan, returned_ranks = self.get_candidates_to_prune(num_filters)
+        prune_targets = self.pruner.lowest_ranking_filters(num_filters)
+        self.pruner.normalize_ranks_per_layer()
+        returned_ranks = self.pruner.return_ranks
         
-        print(f'[STAMP Prune] Pruning plan created for {len(prune_plan)} blocks')
+        print(f'[STAMP Prune] Found {len(prune_targets)} filters to prune')
         
-        # Note: Physical pruning (prune_conv_layer2d) changes the network architecture
-        # which can cause issues with the training loop. The main STAMP benefit
-        # comes from the targeted dropout based on importance.
-        # 
-        # If you want actual filter removal, uncomment the following:
-        # 
-        # unet = self.unet.cpu()
-        # for block_name, layers in prune_plan.items():
-        #     for layer_idx, filter_indices in layers.items():
-        #         for filter_idx in filter_indices:
-        #             unet, _ = prune_conv_layer2d(unet, None, block_idx, layer_idx, filter_idx, use_cuda=False)
-        # self.unet = unet
-        # if self.use_cuda:
-        #     self.unet = self.unet.cuda()
-
+        if physical_prune and len(prune_targets) > 0:
+            print(f'[STAMP Prune] Physically removing filters...')
+            
+            # Move to CPU for pruning
+            unet = self.unet.cpu()
+            
+            # Track which layers are pruned
+            layers_pruned = {}
+            
+            for (block_info, filter_idx, importance) in prune_targets:
+                block_name = block_info[0] if isinstance(block_info, tuple) else block_info
+                layer_idx = block_info[1] if isinstance(block_info, tuple) else 0
+                
+                if block_name not in layers_pruned:
+                    layers_pruned[block_name] = {}
+                if layer_idx not in layers_pruned[block_name]:
+                    layers_pruned[block_name][layer_idx] = 0
+                layers_pruned[block_name][layer_idx] += 1
+            
+            print(f'[STAMP Prune] Layers to be pruned: {layers_pruned}')
+            
+            # Perform physical pruning using prune_conv_layer2d
+            # Need to convert block_name to block_index
+            block_names = list(unet._modules.keys())
+            
+            for (block_info, filter_idx, importance) in prune_targets:
+                block_name = block_info[0] if isinstance(block_info, tuple) else block_info
+                layer_idx = block_info[1] if isinstance(block_info, tuple) else 0
+                
+                try:
+                    # Find block index from block name
+                    if block_name in block_names:
+                        block_idx = block_names.index(block_name)
+                    else:
+                        # Try to find by partial match
+                        block_idx = None
+                        for i, name in enumerate(block_names):
+                            if block_name in name or name in block_name:
+                                block_idx = i
+                                break
+                        if block_idx is None:
+                            print(f'[STAMP Prune] Warning: Could not find block {block_name}, skipping')
+                            continue
+                    
+                    # Call the actual pruning function
+                    unet, _ = prune_conv_layer2d(unet, None, block_idx, layer_idx, filter_idx, use_cuda=False)
+                    
+                except Exception as e:
+                    print(f'[STAMP Prune] Warning: Failed to prune filter {filter_idx} from {block_name}[{layer_idx}]: {e}')
+                    continue
+            
+            # Update model and move back to GPU if needed
+            self.unet = unet
+            if self.use_cuda:
+                self.unet = self.unet.cuda()
+            
+            new_total = self.total_num_filters()
+            print(f'[STAMP Prune] Filters after pruning: {new_total} ({100*new_total/number_of_filters:.1f}% remaining)')
+        
         return returned_ranks
