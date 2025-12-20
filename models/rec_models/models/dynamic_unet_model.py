@@ -193,7 +193,8 @@ class DynamicUnetModel(nn.Module):
         
         # Check if gradients exist
         if conv_layer.weight.grad is None:
-            # Random selection if no gradient
+            # Random selection if no gradient (use fixed seed for reproducibility)
+            random.seed(42)
             return random.randint(0, conv_layer.out_channels - 1)
         
         # Calculate gradient magnitude for each output channel (filter)
@@ -511,7 +512,8 @@ class DynamicUnetModel(nn.Module):
             print("Not enough layers to swap")
             return
         
-        # Randomly select two different layers
+        # Randomly select two different layers (use fixed seed for reproducibility)
+        random.seed(42 + self.swap_count)  # Vary by swap count for different selections
         drop_layer_info = random.choice(swappable_layers)
         add_layer_info = random.choice([l for l in swappable_layers if l != drop_layer_info])
         

@@ -2,8 +2,10 @@
 MRI Reconstruction Models.
 """
 
-# Base U-Net
-from .unet_model import UnetModel
+# Base U-Net - Use FastMRI Unet everywhere
+from fastmri.models.unet import Unet as FastMRIUnet
+# Backward compatible alias
+UnetModel = FastMRIUnet
 
 # Dynamic U-Net
 from .dynamic_unet_model import DynamicUnetModel
@@ -45,8 +47,9 @@ from .vision_transformer import VisionTransformer as VT1
 from .vit_model import VisionTransformer as VT2
 
 __all__ = [
-    # Base
-    'UnetModel',
+    # Base - FastMRI Unet
+    'FastMRIUnet',
+    'UnetModel',  # Backward compatible alias
     'DynamicUnetModel',
     # Conditional
     'CondUnetModel',
