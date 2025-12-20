@@ -13,6 +13,10 @@ parser.add_argument('--dataset', type=str, default='mri', choices=['mri', 'image
                     help='Dataset to use: mri (FastMRI) or imagenet')
 parser.add_argument('--imagenet-path', type=str, default='../ImageNet',
                     help='Path to ImageNet dataset (only used if --dataset=imagenet)')
+parser.add_argument('--rigl-initial-mask', type=str, default=None,
+                    help='Path to pre-computed masks (.pt from SNIP/PUN-IT) for RigL initialization')
+parser.add_argument('--rigl-static-mask', action='store_true',
+                    help='Keep mask static (no RigL updates) - pure static sparse training')
 args, _ = parser.parse_known_args()
 
 data_path = '../data'
@@ -28,6 +32,96 @@ IMAGENET_TRAIN_SIZE = 1281167  # Approximate ImageNet train size
 
 lr = {
     'Unet': {
+        'rec_lr': 5e-4,
+        'sub_lr': {
+            'cartesian': 0.025,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 10,
+            'radial': 30,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'LeanUnet': {  # Constant 32 channels: 32->32->32->32->32, ~0.21M params
+        'rec_lr': 1e-3,  # Higher LR for smaller model
+        'sub_lr': {
+            'cartesian': 0.025,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 10,
+            'radial': 30,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'LeanUnet32': {  # Constant 32 channels: 32->32->32->32->32, ~0.21M params
+        'rec_lr': 1e-3,
+        'sub_lr': {
+            'cartesian': 0.025,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 10,
+            'radial': 30,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'LeanUnet64': {  # Constant 64 channels: 64->64->64->64->64, ~0.84M params
+        'rec_lr': 8e-4,
+        'sub_lr': {
+            'cartesian': 0.025,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 10,
+            'radial': 30,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'LeanUnet128': {  # Constant 128 channels: 128->128->128->128->128, ~3.35M params
+        'rec_lr': 5e-4,
+        'sub_lr': {
+            'cartesian': 0.025,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 10,
+            'radial': 30,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'SmallUnet': {  # 20->40->80->160->320, ~3.0M params
+        'rec_lr': 5e-4,
+        'sub_lr': {
+            'cartesian': 0.025,
+            'radial': 0.005
+        },
+        'noise': {
+            'cartesian': 10,
+            'radial': 30,
+            'image': 6e-5,
+            'radial_pgd': 1,
+            'cartesian_pgd': 4,
+            'none': 0
+        }
+    },
+    'Unet20': {  # Alias for SmallUnet: 20->40->80->160->320
         'rec_lr': 5e-4,
         'sub_lr': {
             'cartesian': 0.025,
@@ -310,7 +404,9 @@ lr = {
     'RigL50': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     'RigL60': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     'RigL70': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
+    'RigL75': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     'RigL80': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
+    'RigL85': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     'RigL90': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     'RigL95': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
     'RigL99': {'rec_lr': 5e-4, 'sub_lr': {'cartesian': 0.025, 'radial': 0.005}, 'noise': {'cartesian': 10, 'radial': 30, 'image': 6e-5, 'radial_pgd': 1, 'cartesian_pgd': 4, 'none': 0}},
@@ -513,7 +609,7 @@ n_shots = 16
 #                           Fewer channels, minimal FDConv kernels for efficiency
 
 # Model can be set via command line: python exp.py --model LightDCNFD
-model = args.model if args.model else 'UnetMasked30'
+model = args.model if args.model else 'LeanUnet32'
 init = 'cartesian'
 noise = ''
 noise_behaviour = ''
@@ -549,6 +645,8 @@ if dataset == 'imagenet':
 else:
     rigl_update_freq = 100  # MRI default: update every 100 iterations
 rigl_delta = 0.31 # Fraction of weights to reallocate
+rigl_initial_mask = args.rigl_initial_mask  # Path to pre-computed masks (from SNIP/PUN-IT) for RigL initialization
+rigl_static_mask = args.rigl_static_mask  # Keep mask static (no RigL updates)
 freeze_masked = False  # Train only non-masked weights (frozen mask training)
 freeze_masked_decoder_only = False  # Train only DECODER's pruned weights
 rigl_checkpoint = None  # Checkpoint to load RigL masks from (for freeze_masked)
@@ -1110,6 +1208,17 @@ if epsilon != 0:
     test_name += f"_intensity_{epsilon}"
     test_name += f"_noise_p_{noise_p}"
 
+# Add mask information to test name for RigL models
+if use_rigl:
+    if rigl_initial_mask:
+        # Extract just the filename without extension
+        mask_name = os.path.splitext(os.path.basename(rigl_initial_mask))[0]
+        test_name += f"_mask-{mask_name}"
+    if rigl_static_mask:
+        test_name += "_static"
+    else:
+        test_name += "_dynamic"
+
 command = f'python3 train.py --test-name={test_name} ' \
           f'--n-shots={n_shots} ' \
           f'--trajectory-learning={trajectory_learning} ' \
@@ -1156,6 +1265,8 @@ command = f'python3 train.py --test-name={test_name} ' \
           f'--rigl-sparsity={rigl_sparsity} ' \
           f'--rigl-update-freq={rigl_update_freq} ' \
           f'--rigl-delta={rigl_delta} ' \
+          f'{f"--rigl-initial-mask={rigl_initial_mask} " if rigl_initial_mask else ""}' \
+          f'{"--rigl-static-mask " if rigl_static_mask else ""}' \
           f'{"--freeze-masked " if freeze_masked else ""}' \
           f'{"--freeze-masked-decoder-only " if freeze_masked_decoder_only else ""}' \
           f'{f"--rigl-checkpoint={rigl_checkpoint} " if rigl_checkpoint else ""}' \
