@@ -45,6 +45,8 @@ class RigLScheduler:
         T_end: int = None,  # When to stop updating (default: 75% of training)
         delta: float = 0.3,  # Fraction of weights to reallocate each update
         exclude_layers: List[str] = None,  # Layer names to exclude from sparsity
+        initial_masks_path: str = None,  # Path to pre-computed masks (e.g., from SNIP)
+        static_mask: bool = False,  # If True, never update masks (static sparse training)
     ):
         """
         Args:
@@ -54,6 +56,8 @@ class RigLScheduler:
             T_end: Iteration to stop mask updates (allows fine-tuning with fixed sparsity)
             delta: Fraction of active weights to drop/regrow each update
             exclude_layers: List of layer name patterns to exclude (e.g., ['first_conv', 'final'])
+            initial_masks_path: Path to .pt file with pre-computed masks (from SNIP/PUN-IT)
+            static_mask: If True, mask is never updated (pure static sparse training)
         """
         self.model = model
         self.sparsity = sparsity
@@ -61,6 +65,8 @@ class RigLScheduler:
         self.T_end = T_end
         self.delta = delta
         self.exclude_layers = exclude_layers or []
+        self.initial_masks_path = initial_masks_path
+        self.static_mask = static_mask
         
         self.iteration = 0
         self.masks: Dict[str, torch.Tensor] = {}
@@ -94,32 +100,103 @@ class RigLScheduler:
             return 'unknown'
     
     def _initialize_masks(self):
-        """Initialize random sparse masks for all eligible layers."""
-        print(f"\n{'='*60}")
-        print(f"RigL Initialization: {self.sparsity*100:.0f}% sparsity")
-        print(f"{'='*60}")
+        """Initialize sparse masks for all eligible layers.
+        
+        If initial_masks_path is provided, loads pre-computed masks (e.g., from SNIP/PUN-IT).
+        Otherwise, creates random sparse masks.
+        """
+        # Load pre-computed masks if provided
+        loaded_masks = None
+        if self.initial_masks_path:
+            print(f"\n{'='*80}")
+            print(f"Loading initial masks from: {self.initial_masks_path}")
+            checkpoint = torch.load(self.initial_masks_path, map_location='cpu')
+            if 'masks' in checkpoint:
+                loaded_masks = checkpoint['masks']
+                loaded_sparsity = checkpoint.get('sparsity', 'unknown')
+                loaded_method = checkpoint.get('method', 'unknown')
+                print(f"  Method: {loaded_method}, Sparsity: {loaded_sparsity}")
+            else:
+                raise ValueError(f"No 'masks' key found in {self.initial_masks_path}")
+        
+        init_type = "Pre-computed" if loaded_masks else "Random"
+        mode_type = "STATIC" if self.static_mask else "DYNAMIC (RigL)"
+        print(f"\n{'='*80}")
+        print(f"Sparse Training: {self.sparsity*100:.0f}% sparsity ({init_type} masks, {mode_type})")
+        print(f"{'='*80}")
+        print(f"{'Status':<8} {'Type':<10} {'Layer Name':<45} {'Shape':<20} {'Active':>12} {'Total':>12} {'Density':>8}")
+        print(f"{'-'*80}")
         
         total_params = 0
         sparse_params = 0
+        skipped_params = 0
+        total_active = 0
+        
+        # Track excluded layers for display
+        self.excluded_layers = {}
         
         for name, module in self.model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Linear)):
-                if self._is_excluded(name):
-                    print(f"  [SKIP] {name}: excluded from sparsity")
-                    continue
-                
                 weight = module.weight
                 numel = weight.numel()
                 
-                # Create random sparse mask
-                mask = torch.ones_like(weight)
-                num_zeros = int(numel * self.sparsity)
+                if self._is_excluded(name):
+                    # Track excluded layer info for display
+                    self.excluded_layers[name] = {
+                        'type': self._classify_layer(name),
+                        'shape': tuple(weight.shape),
+                        'numel': numel,
+                        'module': module,
+                    }
+                    skipped_params += numel
+                    layer_type = self._classify_layer(name)
+                    shape_str = str(list(weight.shape))
+                    print(f"[SKIP]   {layer_type.upper():<10} {name:<45} {shape_str:<20} {numel:>12,} {numel:>12,} {'100.0%':>8}")
+                    continue
                 
-                # Randomly select positions to zero out
-                flat_mask = mask.view(-1)
-                zero_indices = torch.randperm(numel)[:num_zeros]
-                flat_mask[zero_indices] = 0
-                mask = flat_mask.view_as(weight)
+                # Check if we have a pre-computed mask for this layer
+                # Try multiple name variations to handle DataParallel/reconstruction_model wrapping
+                mask = None
+                matched_name = None
+                if loaded_masks:
+                    # Try exact name first
+                    name_variants = [name]
+                    # Strip common prefixes
+                    stripped = name
+                    for prefix in ['module.', 'reconstruction_model.', 'module.reconstruction_model.']:
+                        if stripped.startswith(prefix):
+                            stripped = stripped[len(prefix):]
+                            name_variants.append(stripped)
+                    # Also try the base name without any prefix
+                    name_variants.append(stripped)
+                    
+                    for variant in name_variants:
+                        if variant in loaded_masks:
+                            matched_name = variant
+                            mask = loaded_masks[variant].float()
+                            if mask.shape != weight.shape:
+                                print(f"[WARN] Shape mismatch for {name} (matched {variant}): mask {mask.shape} vs weight {weight.shape}, using random")
+                                mask = None
+                                matched_name = None
+                            else:
+                                num_active = int(mask.sum().item())
+                                num_zeros = numel - num_active
+                                status = "[LOAD]"
+                            break
+                
+                if mask is None:
+                    # Create random sparse mask
+                    mask = torch.ones_like(weight)
+                    num_zeros = int(numel * self.sparsity)
+                    num_active = numel - num_zeros
+                    
+                    # Randomly select positions to zero out (use fixed seed for reproducibility)
+                    flat_mask = mask.view(-1)
+                    generator = torch.Generator().manual_seed(42)
+                    zero_indices = torch.randperm(numel, generator=generator)[:num_zeros]
+                    flat_mask[zero_indices] = 0
+                    mask = flat_mask.view_as(weight)
+                    status = "[RAND]" if loaded_masks else "[RIGL]"
                 
                 self.masks[name] = mask
                 self.layer_info[name] = {
@@ -131,13 +208,19 @@ class RigLScheduler:
                 
                 total_params += numel
                 sparse_params += num_zeros
+                total_active += num_active
                 
                 layer_type = self.layer_info[name]['type']
-                density = (1 - self.sparsity) * 100
-                print(f"  [{layer_type.upper():8}] {name}: {weight.shape} -> {density:.0f}% dense")
+                density = num_active / numel * 100
+                shape_str = str(list(weight.shape))
+                print(f"{status}   {layer_type.upper():<10} {name:<45} {shape_str:<20} {num_active:>12,} {numel:>12,} {density:>7.1f}%")
         
-        print(f"\nTotal: {total_params:,} params, {sparse_params:,} zeros ({sparse_params/total_params*100:.1f}% sparse)")
-        print(f"{'='*60}\n")
+        print(f"{'-'*80}")
+        print(f"RigL Layers:    {total_params:>12,} total params, {total_active:>12,} active ({total_active/total_params*100:.1f}% dense)")
+        print(f"Skipped Layers: {skipped_params:>12,} params (100% dense, not modified by RigL)")
+        if loaded_masks:
+            print(f"Initial Masks:  Loaded from {self.initial_masks_path}")
+        print(f"{'='*80}\n")
     
     def _apply_masks(self):
         """Apply current masks to model weights (zero out masked positions)."""
@@ -176,6 +259,11 @@ class RigLScheduler:
         Should be called AFTER loss.backward() but BEFORE optimizer.step().
         """
         self.iteration += 1
+        
+        # Static mask mode: never update, just enforce sparsity
+        if self.static_mask:
+            self._apply_masks()
+            return
         
         # Check if we should update masks
         if self.iteration % self.update_freq != 0:
@@ -296,29 +384,50 @@ class RigLScheduler:
                 layer_grow_mask = (grow_indices >= start) & (grow_indices < end)
                 layer_grow_indices = grow_indices[layer_grow_mask] - start
                 with torch.no_grad():
+                    # Use fixed seed for reproducibility
+                    generator = torch.Generator(device=device).manual_seed(42 + self.iteration)
                     module.weight.data.view(-1)[layer_grow_indices] = \
-                        torch.randn(layer_grow_indices.numel(), device=device) * 0.01
+                        torch.randn(layer_grow_indices.numel(), device=device, generator=generator) * 0.01
         
-        # Print per-layer changes
-        print(f"\n  PER-LAYER CHANGES:")
+        # Print per-layer status (ALL layers including unchanged and skipped)
+        print(f"\n  {'='*100}")
+        print(f"  ALL LAYERS STATUS:")
+        print(f"  {'='*100}")
+        print(f"  {'Status':<8} {'Type':<10} {'Layer Name':<40} {'Active':>10} {'Total':>10} {'Density':>8} {'Drop':>8} {'Grow':>8} {'Net':>8}")
+        print(f"  {'-'*100}")
         
         encoder_net = 0
         decoder_net = 0
         bottleneck_net = 0
         
+        # First print skipped layers
+        if hasattr(self, 'excluded_layers'):
+            for name, info in self.excluded_layers.items():
+                layer_type = info['type']
+                numel = info['numel']
+                print(f"  {'[SKIP]':<8} {layer_type.upper():<10} {name:<40} {numel:>10,} {numel:>10,} {'100.0%':>8} {'-':>8} {'-':>8} {'-':>8}")
+        
+        # Then print all RigL layers (changed or not)
         for name in layer_names:
             dropped = drops_per_layer[name]
             grown = grows_per_layer[name]
             net_change = grown - dropped
             layer_type = layer_stats_before[name]['type']
             
-            if dropped > 0 or grown > 0:
-                old_density = layer_stats_before[name]['density']
-                new_active = layer_stats_before[name]['active'] + net_change
-                new_density = new_active / layer_stats_before[name]['total'] * 100
-                
-                sign = '+' if net_change >= 0 else ''
-                print(f"    [{layer_type.upper():8}] {name}: D={dropped}, G={grown}, Net={sign}{net_change} ({old_density:.1f}%→{new_density:.1f}%)")
+            old_active = int(layer_stats_before[name]['active'])
+            new_active = old_active + net_change
+            total = layer_stats_before[name]['total']
+            new_density = new_active / total * 100
+            
+            # Show change indicator
+            if net_change > 0:
+                net_str = f"+{net_change}"
+            elif net_change < 0:
+                net_str = f"{net_change}"
+            else:
+                net_str = "0"
+            
+            print(f"  {'[RIGL]':<8} {layer_type.upper():<10} {name:<40} {new_active:>10,} {total:>10,} {new_density:>7.1f}% {dropped:>8} {grown:>8} {net_str:>8}")
             
             if layer_type == 'encoder':
                 encoder_net += net_change
@@ -327,11 +436,17 @@ class RigLScheduler:
             else:
                 bottleneck_net += net_change
         
+        print(f"  {'-'*100}")
+        
         # Summary
-        print(f"\n  FLOW: Encoder={'+' if encoder_net >= 0 else ''}{encoder_net}, Decoder={'+' if decoder_net >= 0 else ''}{decoder_net}, Bottleneck={'+' if bottleneck_net >= 0 else ''}{bottleneck_net}")
+        print(f"\n  CAPACITY FLOW SUMMARY:")
+        print(f"    Encoder:    {'+' if encoder_net >= 0 else ''}{encoder_net:>8} weights")
+        print(f"    Decoder:    {'+' if decoder_net >= 0 else ''}{decoder_net:>8} weights")
+        print(f"    Bottleneck: {'+' if bottleneck_net >= 0 else ''}{bottleneck_net:>8} weights")
         
         if decoder_net > encoder_net:
-            print(f"  ✓ Capacity flowing Encoder → Decoder!")
+            print(f"\n  ✓ Capacity flowing Encoder → Decoder!")
+        print(f"  {'='*100}")
     
     def _log_statistics(self):
         """Log encoder vs decoder density statistics."""
@@ -339,10 +454,12 @@ class RigLScheduler:
         encoder_total = 0
         decoder_active = 0
         decoder_total = 0
+        bottleneck_active = 0
+        bottleneck_total = 0
         
         for name, mask in self.masks.items():
             info = self.layer_info[name]
-            active = mask.sum().item()
+            active = int(mask.sum().item())
             total = info['numel']
             
             if info['type'] == 'encoder':
@@ -351,20 +468,32 @@ class RigLScheduler:
             elif info['type'] == 'decoder':
                 decoder_active += active
                 decoder_total += total
+            else:
+                bottleneck_active += active
+                bottleneck_total += total
         
+        print(f"\n  DENSITY BY REGION:")
         if encoder_total > 0:
             encoder_density = encoder_active / encoder_total
             self.encoder_density_history.append(encoder_density)
-            print(f"  Encoder density: {encoder_density*100:.1f}%")
+            print(f"    Encoder:    {encoder_active:>10,} / {encoder_total:>10,} active ({encoder_density*100:.1f}% dense)")
         
         if decoder_total > 0:
             decoder_density = decoder_active / decoder_total
             self.decoder_density_history.append(decoder_density)
-            print(f"  Decoder density: {decoder_density*100:.1f}%")
+            print(f"    Decoder:    {decoder_active:>10,} / {decoder_total:>10,} active ({decoder_density*100:.1f}% dense)")
+        
+        if bottleneck_total > 0:
+            bottleneck_density = bottleneck_active / bottleneck_total
+            print(f"    Bottleneck: {bottleneck_active:>10,} / {bottleneck_total:>10,} active ({bottleneck_density*100:.1f}% dense)")
+        
+        total_active = encoder_active + decoder_active + bottleneck_active
+        total_all = encoder_total + decoder_total + bottleneck_total
+        print(f"    TOTAL:      {total_active:>10,} / {total_all:>10,} active ({total_active/total_all*100:.1f}% dense)")
         
         if encoder_total > 0 and decoder_total > 0:
             ratio = decoder_density / encoder_density if encoder_density > 0 else float('inf')
-            print(f"  Decoder/Encoder ratio: {ratio:.2f}x")
+            print(f"\n  Decoder/Encoder density ratio: {ratio:.2f}x")
     
     def get_layer_densities(self) -> Dict[str, float]:
         """Get current density for each layer."""
@@ -400,9 +529,11 @@ class RigLScheduler:
         Args:
             start_iteration: The iteration to resume from (e.g., epoch * iters_per_epoch)
         """
-        print(f"\n{'='*60}")
+        print(f"\n{'='*80}")
         print(f"RigL: Reconstructing masks from weights (resuming at iter {start_iteration})")
-        print(f"{'='*60}")
+        print(f"{'='*80}")
+        print(f"{'Status':<8} {'Type':<10} {'Layer Name':<40} {'Active':>12} {'Total':>12} {'Density':>8}")
+        print(f"{'-'*80}")
         
         self.iteration = start_iteration
         
@@ -410,6 +541,15 @@ class RigLScheduler:
         encoder_total = 0
         decoder_active = 0
         decoder_total = 0
+        bottleneck_active = 0
+        bottleneck_total = 0
+        
+        # Print skipped layers first
+        if hasattr(self, 'excluded_layers'):
+            for name, info in self.excluded_layers.items():
+                layer_type = info['type']
+                numel = info['numel']
+                print(f"{'[SKIP]':<8} {layer_type.upper():<10} {name:<40} {numel:>12,} {numel:>12,} {'100.0%':>8}")
         
         for name in list(self.masks.keys()):
             module = self.layer_info[name]['module']
@@ -419,12 +559,12 @@ class RigLScheduler:
             mask = (weight != 0).float()
             self.masks[name] = mask
             
-            active = mask.sum().item()
+            active = int(mask.sum().item())
             total = mask.numel()
             density = active / total * 100
             
             layer_type = self.layer_info[name]['type']
-            print(f"  [{layer_type.upper():8}] {name}: {density:.1f}% dense ({int(active)}/{total})")
+            print(f"{'[RIGL]':<8} {layer_type.upper():<10} {name:<40} {active:>12,} {total:>12,} {density:>7.1f}%")
             
             if layer_type == 'encoder':
                 encoder_active += active
@@ -432,12 +572,23 @@ class RigLScheduler:
             elif layer_type == 'decoder':
                 decoder_active += active
                 decoder_total += total
+            else:
+                bottleneck_active += active
+                bottleneck_total += total
         
+        print(f"{'-'*80}")
+        print(f"\nDENSITY BY REGION:")
         if encoder_total > 0:
-            print(f"\n  Encoder overall: {encoder_active/encoder_total*100:.1f}% dense")
+            print(f"  Encoder:    {encoder_active:>10,} / {encoder_total:>10,} active ({encoder_active/encoder_total*100:.1f}% dense)")
         if decoder_total > 0:
-            print(f"  Decoder overall: {decoder_active/decoder_total*100:.1f}% dense")
-        print(f"{'='*60}\n")
+            print(f"  Decoder:    {decoder_active:>10,} / {decoder_total:>10,} active ({decoder_active/decoder_total*100:.1f}% dense)")
+        if bottleneck_total > 0:
+            print(f"  Bottleneck: {bottleneck_active:>10,} / {bottleneck_total:>10,} active ({bottleneck_active/bottleneck_total*100:.1f}% dense)")
+        
+        total_active = encoder_active + decoder_active + bottleneck_active
+        total_all = encoder_total + decoder_total + bottleneck_total
+        print(f"  TOTAL:      {total_active:>10,} / {total_all:>10,} active ({total_active/total_all*100:.1f}% dense)")
+        print(f"{'='*80}\n")
 
 
 class SparseConv2d(nn.Conv2d):
@@ -458,7 +609,9 @@ class SparseConv2d(nn.Conv2d):
         num_zeros = int(numel * self.sparsity)
         
         flat_mask = self.mask.view(-1)
-        zero_indices = torch.randperm(numel)[:num_zeros]
+        # Use fixed seed for reproducibility
+        generator = torch.Generator().manual_seed(42)
+        zero_indices = torch.randperm(numel, generator=generator)[:num_zeros]
         flat_mask[zero_indices] = 0
         self.mask = flat_mask.view_as(self.weight)
         
@@ -509,8 +662,14 @@ def apply_rigl_to_model(
     """
     exclude = []
     if exclude_first_last:
-        # Common patterns for first/last layers
-        exclude = ['first', 'initial', 'final', 'last', 'output', 'conv.0']
+        # Patterns for first/last layers across different architectures:
+        # - UnetModel: first, final, conv.0
+        # - FastMRI Unet: down_sample_layers.0.layers.0, up_conv.3.1
+        exclude = [
+            'first', 'initial', 'final', 'last', 'output',  # Generic patterns
+            'down_sample_layers.0.layers.0',  # FastMRI Unet first conv
+            'up_conv.3.1',  # FastMRI Unet final conv
+        ]
     
     T_end = int(total_iters * 0.75) if total_iters else None
     
